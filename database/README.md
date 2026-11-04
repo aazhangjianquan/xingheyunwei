@@ -46,6 +46,8 @@ License 关联项目：新版 API 启动自动增加 `project_id` 及索引、My
 
 ## 飞书 open_id 加密升级
 
+到期飞书提醒：新版 API 自动为资源和 License 增加提醒开关、修订号和修改人字段，并创建 `reminder_plans`、`reminder_deliveries`、`resource_reminder_contacts`。也可执行可重复运行的 `v1.0.3.sql`。历史单据默认开启；实际接入由独立调度服务按生效状态、有效期和最近适用节点进行，保留原有通知与密钥。更新时同步部署 API、Worker、前端和 `reminder-scheduler`，详情见 `../docs/expiry-reminders-design.md`。
+
 `users.feishu_open_id` 使用应用主密钥自动加密写入数据库，应用 ORM 读取时才在内存中解密。接口只返回脱敏值，飞书通知发送前短暂解密，不把完整 open_id 返回给前端。新版 API 启动会迁移历史明文；也可先执行 `upgrade_feishu_open_id.sql` 扩展字段，再重启 API 完成迁移。必须备份数据库和 `api_instance/keys.json`，更换主密钥会使历史密文不可恢复。
 
 ## v1.0.1 角色与部门职责

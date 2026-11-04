@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-reminder-scheduler
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: workspace-reminder-scheduler
+  template:
+    metadata:
+      labels:
+        app: workspace-reminder-scheduler
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reminder-scheduler
+          image: workspace-api-image
+          imagePullPolicy: IfNotPresent
+          command: [python, -m, app.reminder_scheduler]
+          envFrom:
+            - configMapRef:
+                name: workspace-config
+            - secretRef:
+                name: workspace-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            exec:
+              command: [python, -m, app.reminder_scheduler, --healthcheck]
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: [python, -m, app.reminder_scheduler, --healthcheck]
+            periodSeconds: 10
+            timeoutSeconds: 4
+          volumeMounts:
+            - name: instance
+              mountPath: /app/instance
+            - name: temp
+              mountPath: /tmp
+      volumes:
+        - name: instance
+          emptyDir:
+            sizeLimit: 32Mi
+        - name: temp
+          emptyDir:
+            sizeLimit: 128Mi

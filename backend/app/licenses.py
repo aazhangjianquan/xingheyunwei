@@ -17,6 +17,7 @@ from .roles import has_role
 from .security import decrypt_secret, encrypt_secret
 from .license_tool import generate_key
 from . import audit as operation_audit
+from . import reminders
 
 
 class LicenseIn(BaseModel):
@@ -30,6 +31,7 @@ class LicenseIn(BaseModel):
     account_number: int = Field(default=-1, ge=-1, le=2147483647)
     agent_number: int = Field(default=-1, ge=-1, le=2147483647)
     purpose: str = Field(min_length=1, max_length=10000)
+    reminder_enabled: bool = True
 
 
 class LegacyReviewIn(BaseModel):
@@ -77,7 +79,8 @@ def can_view_key(item, user):
 def license_out(item, names, user, include_key=False):
     fields = ('id', 'code', 'applicant_id', 'project_id', 'project_name', 'customer', 'product',
               'tenant_id', 'expire_time', 'account_number', 'agent_number', 'purpose', 'status',
-              'stage', 'final_approver_id', 'generated_by', 'generated_at', 'created_at', 'updated_at')
+              'stage', 'final_approver_id', 'generated_by', 'generated_at', 'created_at', 'updated_at',
+              'reminder_enabled', 'reminder_revision')
     result = {name: getattr(item, name) for name in fields}
     result = {k: (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).isoformat()
               if isinstance(v, datetime) else v for k, v in result.items()}
@@ -144,11 +147,14 @@ def register_routes(app, current_user):
         page: int = Query(default=1, ge=1), page_size: int = Query(default=10),
         status: Literal['all', 'pending', 'in_progress', 'generated', 'rejected'] = Query(default='all'),
         q: str = Query(default='', max_length=100),
+        reminder: Literal['all', 'enabled', 'disabled'] = Query(default='all'),
         db: Session = Depends(get_db), user=Depends(current_user),
     ):
         if page_size not in {10, 20, 50}:
             raise HTTPException(422, '每页条数仅支持 10、20、50')
         base = visible(select(LicenseRequest), user)
+        if reminder != 'all':
+            base = base.where(LicenseRequest.reminder_enabled.is_(reminder == 'enabled'))
         if term := q.strip():
             matches_owner = LicenseRequest.applicant_id.in_(select(User.id).where(User.display_name.contains(term, autoescape=True)))
             base = base.where(or_(matches_owner, *(field.contains(term, autoescape=True) for field in (
@@ -227,7 +233,10 @@ def register_routes(app, current_user):
         before = operation_audit.snapshot(db, 'license', item)
         check_expiration(data)
         project = application_project(db, data.project_id, user)
-        for field, value in {**data.model_dump(), 'project_name': project.name}.items():
+        payload = data.model_dump(exclude={'reminder_enabled'})
+        if 'reminder_enabled' in data.model_fields_set:
+            reminders.set_enabled(item, data.reminder_enabled, user)
+        for field, value in {**payload, 'project_name': project.name}.items():
             setattr(item, field, value)
         # A previously generated legacy key must never survive changed parameters.
         item.license_key_ciphertext = item.license_key_hash = None

@@ -46,12 +46,13 @@ LABELS = dict(
     feishu_login_enabled='飞书登录', feishu_tenant_key='飞书租户', database='数据库连接',
     key='空间标识', description='空间说明', owner_id='空间负责人', kind='访问范围',
     resource_catalog='资源类型与规格配置',
+    reminder_enabled='到期提醒', reminder_contact='资源提醒运维人员',
 )
 FIELDS = {
-    'resource': 'environment resource_type specification start_date end_date purpose capacity_basis ports whitelist status stage',
+    'resource': 'environment resource_type specification start_date end_date purpose capacity_basis ports whitelist status stage reminder_enabled',
     'change': 'name environment change_type window_start window_end ops_owner_id problem_description plan rollback_plan status stage',
     'delivery': 'name customer cloud_type deployment_mode environment compute_type accelerator network_notes db_whitelist security_group account_validation notes status stage',
-    'license': 'customer product tenant_id expire_time account_number agent_number purpose status stage',
+    'license': 'customer product tenant_id expire_time account_number agent_number purpose status stage reminder_enabled',
     'project': 'name department active', 'user': 'username display_name department active',
     'wiki': 'title category status version',
     'wiki_space': 'key name description category kind owner_id',

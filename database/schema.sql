@@ -305,6 +305,10 @@ CREATE TABLE IF NOT EXISTS resource_requests (
 	created_at DATETIME NOT NULL, 
 	updated_at DATETIME NOT NULL, 
 	deleted_at DATETIME NULL,
+	reminder_enabled BOOLEAN NOT NULL DEFAULT 1,
+	reminder_revision INTEGER NOT NULL DEFAULT 1,
+	reminder_updated_by INTEGER NULL,
+	reminder_updated_at DATETIME NULL,
 	PRIMARY KEY (id), 
 	FOREIGN KEY(project_id) REFERENCES projects (id), 
 	UNIQUE (code), 
@@ -418,6 +422,10 @@ CREATE TABLE IF NOT EXISTS license_requests (
 	created_at DATETIME NOT NULL, 
 	updated_at DATETIME NOT NULL, 
 	deleted_at DATETIME NULL,
+	reminder_enabled BOOLEAN NOT NULL DEFAULT 1,
+	reminder_revision INTEGER NOT NULL DEFAULT 1,
+	reminder_updated_by INTEGER NULL,
+	reminder_updated_at DATETIME NULL,
 	PRIMARY KEY (id), 
 	UNIQUE (code), 
 	FOREIGN KEY(applicant_id) REFERENCES users (id), 
@@ -479,3 +487,56 @@ CREATE TABLE IF NOT EXISTS delivery_attachments (
 	UNIQUE (storage_key),
 	KEY `ix_delivery_attachments_delivery_id` (delivery_id)
 )CHARSET=utf8mb4 ENGINE=InnoDB;
+
+-- 到期提醒计划与按收件人去重记录
+
+CREATE TABLE IF NOT EXISTS reminder_plans (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	object_type VARCHAR(30) NOT NULL,
+	object_id INTEGER NOT NULL,
+	period VARCHAR(100) NOT NULL,
+	instance_id INTEGER,
+	rule VARCHAR(30) NOT NULL,
+	scheduled_at DATETIME NOT NULL,
+	expires_at DATETIME NOT NULL,
+	state VARCHAR(20) NOT NULL,
+	note VARCHAR(180) NOT NULL,
+	PRIMARY KEY (id),
+	CONSTRAINT uq_reminder_plan UNIQUE (object_type, object_id, period, rule),
+	FOREIGN KEY(instance_id) REFERENCES workflow_instances (id),
+	INDEX ix_reminder_plans_due (state, scheduled_at, id),
+	INDEX ix_reminder_plans_object (object_type, object_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS reminder_deliveries (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	plan_id INTEGER NOT NULL,
+	recipient_id INTEGER NOT NULL,
+	notification_id INTEGER NOT NULL,
+	PRIMARY KEY (id),
+	CONSTRAINT uq_reminder_delivery UNIQUE (plan_id, recipient_id),
+	FOREIGN KEY(plan_id) REFERENCES reminder_plans (id),
+	FOREIGN KEY(recipient_id) REFERENCES users (id),
+	UNIQUE (notification_id),
+	FOREIGN KEY(notification_id) REFERENCES notification_logs (id),
+	INDEX ix_reminder_deliveries_plan_id (plan_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS resource_reminder_contacts (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	resource_id INTEGER NOT NULL,
+	instance_id INTEGER NOT NULL,
+	user_id INTEGER NOT NULL,
+	source_task_id INTEGER,
+	source VARCHAR(20) NOT NULL,
+	reason VARCHAR(500) NOT NULL,
+	created_by INTEGER,
+	PRIMARY KEY (id),
+	CONSTRAINT uq_resource_reminder_contact UNIQUE (resource_id, instance_id, user_id),
+	FOREIGN KEY(resource_id) REFERENCES resource_requests (id),
+	FOREIGN KEY(instance_id) REFERENCES workflow_instances (id),
+	FOREIGN KEY(user_id) REFERENCES users (id),
+	FOREIGN KEY(source_task_id) REFERENCES approvals (id),
+	FOREIGN KEY(created_by) REFERENCES users (id),
+	INDEX ix_resource_reminder_contacts_resource_id (resource_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -32,6 +32,8 @@ from . import audit as operation_audit
 from .rate_limit import check_request_rate, client_ip, trusted_proxies
 from . import redis_runtime
 from . import resource_catalog
+from . import reminders
+from .notifications import create_notification
 from .startup import initialization_lock
 from .bootstrap import demo_enabled, ensure_administrator
 
@@ -252,12 +254,8 @@ def get_visible(db: Session, model, item_id: int, user: User):
 
 def notify(db: Session, tasks: BackgroundTasks, recipient_ids: list[int], event: str, object_type: str, obj, text: str, commit=True):
     ids = []
-    section = "licenses" if object_type == "license" else object_type
-    link = f"{settings.value(db, 'public_base_url').rstrip('/')}/{section}/{obj.id}"
     for uid in set(recipient_ids):
-        log = NotificationLog(recipient_id=uid, event=event, object_type=object_type, object_id=obj.id, message=f"【{settings.value(db, 'site_name')}】{text}\n{link}")
-        db.add(log)
-        db.flush()
+        log = create_notification(db, uid, event, object_type, obj, text)
         ids.append(log.id)
     if commit:
         db.commit()
@@ -303,6 +301,7 @@ def workflow_notifications(db, tasks, kind, obj, owner, event='status_changed', 
         headline = '您有一项待执行任务' if execution else '您有一项待审批申请'
         text = f'{headline}\n{context}\n待处理环节：{node_names}\n请登录平台查看并处理。'
         notify(db, tasks, [uid], 'approval_required', kind, obj, text, commit=False)
+    reminders.sync_plans(db, kind, obj)
     db.commit()
 
 
@@ -599,6 +598,19 @@ class ResourceIn(BaseModel):
     capacity_basis: str = Field(min_length=1)
     ports: str = ""
     whitelist: str = ""
+    reminder_enabled: bool = True
+
+    @field_validator('start_date', 'end_date')
+    @classmethod
+    def valid_date(cls, value):
+        from datetime import date
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            raise ValueError('日期格式须为 YYYY-MM-DD')
+        if parsed.isoformat() != value:
+            raise ValueError('日期格式须为 YYYY-MM-DD')
+        return value
 
 
 @app.get("/api/resource-catalog")
@@ -611,6 +623,7 @@ class ListQuery(BaseModel):
     page_size: Literal[10, 20, 50] = 10
     status: Literal['all', 'pending', 'in_progress', 'completed', 'rejected'] = 'all'
     q: str = Field(default='', max_length=100)
+    reminder: Literal['all', 'enabled', 'disabled'] = 'all'
 
 
 def list_query(
@@ -618,10 +631,11 @@ def list_query(
     page_size: int = Query(default=10),
     status: Literal['all', 'pending', 'in_progress', 'completed', 'rejected'] = Query(default='all'),
     q: str = Query(default='', max_length=100),
+    reminder: Literal['all', 'enabled', 'disabled'] = Query(default='all'),
 ):
     if page_size not in {10, 20, 50}:
         raise HTTPException(422, '每页条数仅支持 10、20、50')
-    return ListQuery(page=page, page_size=page_size, status=status, q=q)
+    return ListQuery(page=page, page_size=page_size, status=status, q=q, reminder=reminder)
 
 
 def paginated_records(db: Session, model, user: User, options: ListQuery):
@@ -632,6 +646,8 @@ def paginated_records(db: Session, model, user: User, options: ListQuery):
     """
     owner_column = model.applicant_id if model is ResourceRequest else model.owner_id
     base = visible(select(model), model, user)
+    if model is ResourceRequest and options.reminder != 'all':
+        base = base.where(ResourceRequest.reminder_enabled.is_(options.reminder == 'enabled'))
     term = options.q.strip()
     if term:
         fields = {
@@ -811,6 +827,8 @@ def detail(db: Session, kind: str, item, user=None, **extra):
     snapshot = rounds[-1]['snapshot'] if rounds else {}
     owner_id = flow.owner_id(kind, item)
     can_delete = bool(user and (user.id == owner_id or has_role(user, 'admin') or (kind == 'license' and has_role(user, 'license_manager'))))
+    if kind in {'resource', 'license'}:
+        extra['reminder'] = reminders.info(db, kind, item, user)
     return serialize(item, current_node=current_node, my_tasks=my_tasks, can_delete=can_delete,
         approval_round=rounds[-1]['round'] if rounds else None,
         owner_name=owner.display_name, owner_department=owner.department,
@@ -925,6 +943,10 @@ def resubmit(kind, item_id, data, tasks, db, user):
     if kind == 'change' and data.window_end <= data.window_start: raise HTTPException(400, '维护窗口无效')
     payload = data.model_dump()
     if kind == 'resource':
+        enabled = payload.pop('reminder_enabled')
+        if 'reminder_enabled' in data.model_fields_set:
+            reminders.set_enabled(item, enabled, user)
+    if kind == 'resource':
         payload.pop('specification_values', None)
         payload['specification'] = resource_specification
         payload['specification_values'] = json.dumps(resource_catalog.specification_snapshot(db, data.resource_type, resource_specification_values), ensure_ascii=False)
@@ -959,7 +981,7 @@ register_knowledge_routes(app, current_user)
 
 @app.get("/api/notifications")
 def notifications(page: int | None = Query(None, ge=1), page_size: int = Query(10),
-                  q: str = Query('', max_length=100), status: Literal['all', 'sent', 'failed', 'unconfigured', 'pending'] = 'all',
+                  q: str = Query('', max_length=100), status: Literal['all', 'sent', 'failed', 'unconfigured', 'pending', 'cancelled', 'skipped'] = 'all',
                   db: Session = Depends(get_db), user: User = Depends(current_user)):
     if page_size not in {10, 20, 50}: raise HTTPException(422, '每页条数仅支持 10、20、50')
     query = select(NotificationLog).order_by(NotificationLog.id.desc())
@@ -1004,4 +1026,6 @@ register_license_routes(app, current_user)
 operation_audit.register_routes(app, current_user, require_role)
 from .attachments import register_routes as register_attachment_routes
 register_attachment_routes(app, current_user, get_visible)
+
+reminders.register_routes(app, current_user)
 

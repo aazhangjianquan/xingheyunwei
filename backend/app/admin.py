@@ -93,11 +93,16 @@ def register_routes(app, current_user, require_role):
 
     @app.post("/api/admin/notifications/{item_id}/retry")
     def retry_notification(item_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db), user=Depends(admin)):
+        from . import reminders
+        context = reminders.lock_notification_context(db, item_id)
         item = db.scalar(select(NotificationLog).where(NotificationLog.id == item_id).with_for_update())
         if not item or item.status == "sent":
             raise HTTPException(400, "通知不存在或已经发送")
         if item.status == 'pending' and item.dispatch_ready:
             raise HTTPException(400, '通知已在队列中，请等待处理')
+        invalid = reminders.invalid_reason(db, context)
+        if invalid:
+            raise HTTPException(409, invalid[1])
         item.status = "pending"
         item.error = ""
         item.attempt_count = 0

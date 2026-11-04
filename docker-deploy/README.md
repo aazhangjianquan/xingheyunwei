@@ -84,3 +84,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 300 api worker front
 ## v1.0.2 知识库版本升级
 
 本目录 `v1.0.2.sql` 只补充文章并发修订号，可重复执行，不删除正文和历史版本。已有库先备份，再执行升级并更新 API、Worker 和前端镜像；新版 API 启动也可自动补字段。更新后刷新编辑页面，自动保存不增加版本，点击“保存文档”成功后增加一个版本。不需要新增环境变量或挂载。详见 `../docs/wiki-versioning-v1.0.2.md`。
+
+## v1.0.3 到期飞书提醒升级
+
+本目录 `v1.0.3.sql` 增加 License、资源申请的提醒开关，以及提醒计划、按收件人去重投递和资源运维责任人表，可重复执行，保留历史数据。升级时同步更新 API、通知 Worker、前端与 `reminder-scheduler`；新版 API 启动也会自动迁移。

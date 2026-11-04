@@ -61,6 +61,10 @@ def upgrade(engine):
                         "personal_user_id": "INTEGER NULL", "members_initialized": "BOOLEAN NOT NULL DEFAULT 0",
                         "category": "VARCHAR(60) NOT NULL DEFAULT ''", "deleted_at": "DATETIME NULL"},
     }
+    for table in ('resource_requests', 'license_requests'):
+        additions[table].update(reminder_enabled='BOOLEAN NOT NULL DEFAULT 1',
+            reminder_revision='INTEGER NOT NULL DEFAULT 1', reminder_updated_by='INTEGER NULL',
+            reminder_updated_at='DATETIME NULL')
     for table, fields in additions.items():
         if table not in inspector.get_table_names():
             continue

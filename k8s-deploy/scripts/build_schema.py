@@ -61,7 +61,7 @@ CREATE DATABASE IF NOT EXISTS `yunweishenji` CHARACTER SET utf8mb4 COLLATE utf8m
 USE `yunweishenji`;
 
 '''
-        return header + '\n\n'.join(statements) + '\n'
+        return '\n'.join(line.rstrip() for line in (header + '\n\n'.join(statements)).splitlines()) + '\n'
 
 
 if __name__ == '__main__':

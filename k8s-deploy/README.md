@@ -2,7 +2,7 @@
 
 先看本文件的安装顺序，再对照 [CONFIGURATION.md](CONFIGURATION.md) 修改配置。此目录提供 K8s 清单，现有 `docker-compose.yml` 保留用于本机开发、数据导出和迁移；K8s 不读取 Compose 的变量或数据卷。
 
-包内没有真实密码、MinIO AK/SK、测试账号或测试单据。`v1.0.0.sql` 是当前 28 张表的完整纯结构安装脚本。
+包内没有真实密码、MinIO AK/SK、测试账号或测试单据。`v1.0.0.sql` 是当前 31 张表的完整纯结构安装脚本。
 
 ## 文件位置
 
@@ -65,7 +65,7 @@ docker buildx build --platform linux/amd64 -f frontend/Dockerfile -t registry.ex
 mysql --host=数据库地址 --port=3306 --user=有建库权限的账号 --password < k8s-deploy/v1.0.0.sql
 ```
 
-导入后 28 张表均为空。应用首次启动才会创建你指定的初始管理员，以及必要的角色、空知识空间、流程模板、资源类型和系统配置；不会创建演示用户、项目、文章、申请单或通知。默认流程模板需要登录后配置实际岗位成员并发布。
+导入后 31 张表均为空。应用首次启动才会创建你指定的初始管理员，以及必要的角色、空知识空间、流程模板、资源类型和系统配置；不会创建演示用户、项目、文章、申请单或通知。默认流程模板需要登录后配置实际岗位成员并发布。
 
 准备私有输入，编辑数据库连接和 MinIO 凭据：
 
@@ -131,6 +131,7 @@ kubectl apply -k k8s-deploy
 kubectl -n project-workspace rollout status statefulset/workspace-redis --timeout=300s
 kubectl -n project-workspace rollout status deployment/workspace-api --timeout=600s
 kubectl -n project-workspace rollout status deployment/workspace-worker --timeout=600s
+kubectl -n project-workspace rollout status deployment/workspace-reminder-scheduler --timeout=600s
 kubectl -n project-workspace rollout status deployment/workspace-frontend --timeout=300s
 kubectl -n project-workspace get pods,svc,ingress,pvc
 ```
@@ -150,7 +151,7 @@ kubectl -n project-workspace get pods,svc,ingress,pvc
 更新 `config.env` / Nginx 模板后重新 `kubectl apply -k`，Kustomize 的 ConfigMap 哈希会触发相关 Pod 更新。更新 Secret 后需明确滚动重启 API 和 Worker；若改 Redis 密码，还需同步 Redis，并安排短暂切换窗口。后端代码更新时同时更新 API / Worker 镜像，不要只更新 API。
 
 ```sh
-kubectl -n project-workspace rollout restart deployment/workspace-api deployment/workspace-worker
+kubectl -n project-workspace rollout restart deployment/workspace-api deployment/workspace-worker deployment/workspace-reminder-scheduler
 # 临时扩容；长期配置应同时修改对应 Deployment 的 replicas，避免下次 apply 覆盖。
 kubectl -n project-workspace scale deployment/workspace-api --replicas=3
 kubectl -n project-workspace scale deployment/workspace-worker --replicas=2
@@ -184,3 +185,7 @@ kubectl -n project-workspace exec -i workspace-mysql-0 -- sh -c 'MYSQL_PWD="$MYS
 ## v1.0.2 知识库版本升级
 
 本目录 `v1.0.2.sql` 只补充文章并发修订号，可重复执行，不删除正文和历史版本。已有库先备份，再执行升级并更新 API、Worker 和前端镜像；新版 API 启动也可自动补字段。更新后刷新编辑页面，自动保存不增加版本，点击“保存文档”成功后增加一个版本。不需要新增环境变量或挂载。详见 `../docs/wiki-versioning-v1.0.2.md`。
+
+## v1.0.3 到期飞书提醒升级
+
+本目录 `v1.0.3.sql` 增加 License、资源申请的提醒开关，以及提醒计划、按收件人去重投递和资源运维责任人表，可重复执行，保留历史数据。升级时同步更新 API、通知 Worker、前端与 `reminder-scheduler`；新版 API 启动也会自动迁移。

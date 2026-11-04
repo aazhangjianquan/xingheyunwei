@@ -36,7 +36,7 @@ def validate(ready=False):
     assert config['ATTACHMENT_STORAGE']=='minio'
     for variable in ('TRUSTED_PROXY_CIDRS', 'INGRESS_PROXY_CIDR'):
         assert config[variable] and '0.0.0.0/0' not in config[variable]
-    for name in ('workspace-api','workspace-worker'):
+    for name in ('workspace-api','workspace-worker','workspace-reminder-scheduler'):
         pod = indexed[('Deployment',name)]['spec']['template']['spec']
         container = pod['containers'][0]
         assert pod['securityContext']['runAsNonRoot'] is True
@@ -55,7 +55,7 @@ def validate(ready=False):
     sql = (ROOT/'v1.0.0.sql').read_text()
     assert not re.search(r'^\s*(INSERT|REPLACE|UPDATE|DELETE|TRUNCATE|DROP)\b', sql, re.I|re.M)
     tables = re.findall(r'^CREATE TABLE IF NOT EXISTS\s+`?(\w+)', sql, re.M)
-    assert len(tables)==len(set(tables))==28
+    assert len(tables)==len(set(tables))==31
     if ready:
         assert 'example.com' not in rendered, '请替换镜像和 Ingress 域名占位值'
         secret_path = ROOT/'.private/workspace-secrets.yaml'

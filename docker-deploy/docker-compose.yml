@@ -96,6 +96,30 @@ services:
       api:
         condition: service_healthy
 
+  reminder-scheduler:
+    image: yunweishenji-api:latest
+    container_name: xinghe_reminder_scheduler
+    restart: unless-stopped
+    command: ["python", "-m", "app.reminder_scheduler"]
+    # 以下六项与 API 保持一致；Worker 不需要附件及管理员初始化配置。
+    environment:
+      DATABASE_URL: "mysql+pymysql://xinghe:XingHe2026XMXZ@mysql:3306/yunweishenji?charset=utf8mb4"
+      DATABASE_CONFIG_MODE: "environment"
+      APP_SECRET: "BZ48AaIH54UAggpu2Hb0NhvAjTpfEkEKnNb-v1RUQsAeqR-jHdSOsnUixyF7RMHy"
+      FERNET_KEY: "HI3SacrrqcnC48iodlu1i1Fp7CloVA6G2rX7Ll72nmk="
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+    depends_on:
+      api:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.reminder_scheduler", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
   frontend:
     image: yunweishenji-frontend:latest
     container_name: xinghe_frontend

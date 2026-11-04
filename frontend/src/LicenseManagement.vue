@@ -2,12 +2,13 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Copy, FileKey2, KeyRound, Plus, RefreshCw, Search, X } from 'lucide-vue-next'
 import { get, post, del } from './api'
+import ExpiryReminder from './ExpiryReminder.vue'
 
 const props = defineProps({ user: { type: Object, required: true } })
 const emit = defineEmits(['notice'])
 const items = ref([]), counts = ref({ all: 0, pending: 0, in_progress: 0, generated: 0, rejected: 0 }), canManage = ref(false)
 const page = ref(1), pageSize = ref(10), total = ref(0), totalPages = ref(1)
-const search = ref(''), status = ref('all')
+const search = ref(''), status = ref('all'), reminderFilter = ref('all')
 const loading = ref(false), saving = ref(false), listError = ref(''), modalError = ref('')
 const modal = ref(''), detail = ref(null), form = ref({}), deleteConfirm = ref(false)
 const projects = ref([]), projectsLoading = ref(false), projectsError = ref(''), legacyProjectId = ref(null)
@@ -29,7 +30,7 @@ async function load() {
   loading.value = true
   listError.value = ''
   try {
-    const params = new URLSearchParams({ page: String(page.value), page_size: String(pageSize.value), status: status.value, q: search.value.trim() })
+    const params = new URLSearchParams({ page: String(page.value), page_size: String(pageSize.value), status: status.value, q: search.value.trim(), reminder: reminderFilter.value })
     const result = await get(`/licenses?${params}`)
     if (disposed || current !== revision) return
     items.value = result.items
@@ -56,7 +57,7 @@ function scheduleLoad(delay = 0) {
   loading.value = true
   searchTimer = window.setTimeout(load, delay)
 }
-watch([status, pageSize], () => {
+watch([status, pageSize, reminderFilter], () => {
   skipPageLoad = true; page.value = 1; skipPageLoad = false
   scheduleLoad()
 }, { flush: 'sync' })
@@ -87,7 +88,7 @@ async function loadProjects(path = '/projects') {
 async function newApplication() {
   closeModal()
   resubmitId.value = null
-  form.value = { project_id: null, customer: '', product: '', tenant_id: 1, expire_at: '', account_number: -1, agent_number: -1, purpose: '' }
+  form.value = { project_id: null, customer: '', product: '', tenant_id: 1, expire_at: '', account_number: -1, agent_number: -1, purpose: '', reminder_enabled: true }
   modal.value = 'apply'
   await loadProjects()
 }
@@ -160,7 +161,7 @@ async function submitReview() {
 async function editRejected() {
   const item = detail.value
   ++detailRevision
-  form.value = Object.fromEntries(['project_id','customer','product','tenant_id','account_number','agent_number','purpose'].map(k => [k,item[k]]))
+  form.value = Object.fromEntries(['project_id','customer','product','tenant_id','account_number','agent_number','purpose','reminder_enabled'].map(k => [k,item[k]]))
   form.value.expire_at = new Date(item.expire_time + 8*3600000).toISOString().slice(0,16)
   resubmitId.value = item.id
   modal.value = 'apply'
@@ -226,14 +227,14 @@ onBeforeUnmount(() => {
     <section class="panel list-panel" :aria-busy="loading">
       <div class="list-toolbar">
         <div class="tab-strip" aria-label="按 License 状态筛选"><button v-for="tab in tabs" :key="tab.key" :class="{ selected: status === tab.key }" :aria-pressed="status === tab.key" @click="status = tab.key">{{ tab.label }} <span>{{ counts[tab.key] }}</span></button></div>
-        <div class="license-list-actions"><div class="search-box"><Search :size="17" /><input v-model="search" aria-label="搜索 License 申请" placeholder="搜索项目、客户、产品、申请人…" maxlength="100" /></div><button class="icon-button" :disabled="loading" title="刷新申请" @click="load"><RefreshCw :size="17" /></button></div>
+        <div class="license-list-actions"><select v-model="reminderFilter" aria-label="License 提醒筛选"><option value="all">全部提醒状态</option><option value="enabled">提醒已开启</option><option value="disabled">提醒已关闭</option></select><div class="search-box"><Search :size="17" /><input v-model="search" aria-label="搜索 License 申请" placeholder="搜索项目、客户、产品、申请人…" maxlength="100" /></div><button class="icon-button" :disabled="loading" title="刷新申请" @click="load"><RefreshCw :size="17" /></button></div>
       </div>
       <div v-if="listError" class="license-error" role="alert">{{ listError }}<button class="text-button" @click="load">重试</button></div>
       <div class="table-wrap">
         <table class="data-table">
-          <thead><tr><th>编号 / 项目</th><th>客户 / 产品</th><th>租户 ID</th><th>申请人</th><th>到期时间（北京时间）</th><th>状态</th><th>License Key</th></tr></thead>
-          <tbody v-if="loading"><tr><td colspan="7" class="list-loading" role="status">正在查询 License 申请…</td></tr></tbody>
-          <tbody v-else><tr v-for="item in items" :key="item.id" @click="openDetail(item.id)"><td><div class="table-title"><FileKey2 :size="20" /><div><strong>{{ item.project_name }}</strong><small>{{ item.code }}</small></div></div></td><td><div class="table-title"><div><strong>{{ item.customer }}</strong><small>{{ item.product }}</small></div></div></td><td>{{ item.tenant_id }}</td><td>{{ item.applicant_name }}</td><td class="table-date">{{ dateTime(item.expire_time) }}</td><td><span class="status-tag" :class="{generated:'green',rejected:'red',in_progress:'blue'}[item.status] || 'amber'"><i></i>{{ statusLabels[item.status] }}</span></td><td><button class="text-button" @click.stop="openDetail(item.id)">{{ item.can_view_key ? '查看 Key' : '查看申请' }}</button></td></tr></tbody>
+          <thead><tr><th>编号 / 项目</th><th>客户 / 产品</th><th>租户 ID</th><th>申请人</th><th>到期时间（北京时间）</th><th>状态</th><th>到期提醒</th><th>License Key</th></tr></thead>
+          <tbody v-if="loading"><tr><td colspan="8" class="list-loading" role="status">正在查询 License 申请…</td></tr></tbody>
+          <tbody v-else><tr v-for="item in items" :key="item.id" @click="openDetail(item.id)"><td><div class="table-title"><FileKey2 :size="20" /><div><strong>{{ item.project_name }}</strong><small>{{ item.code }}</small></div></div></td><td><div class="table-title"><div><strong>{{ item.customer }}</strong><small>{{ item.product }}</small></div></div></td><td>{{ item.tenant_id }}</td><td>{{ item.applicant_name }}</td><td class="table-date">{{ dateTime(item.expire_time) }}</td><td><span class="status-tag" :class="{generated:'green',rejected:'red',in_progress:'blue'}[item.status] || 'amber'"><i></i>{{ statusLabels[item.status] }}</span></td><td>{{ item.reminder_enabled ? '已开启' : '已关闭' }}</td><td><button class="text-button" @click.stop="openDetail(item.id)">{{ item.can_view_key ? '查看 Key' : '查看申请' }}</button></td></tr></tbody>
         </table>
         <div v-if="!loading && !listError && !items.length" class="empty-state"><div class="empty-icon"><KeyRound :size="25" /></div><strong>暂无符合条件的 License 申请</strong><p>调整筛选条件，或提交新的授权申请。</p></div>
       </div>
@@ -252,6 +253,7 @@ onBeforeUnmount(() => {
               <label class="field"><span>授权产品 <b>*</b></span><input v-model.trim="form.product" required maxlength="150" placeholder="请输入产品名称" /></label>
               <label class="field"><span>租户 ID <b>*</b></span><input v-model.number="form.tenant_id" type="number" required min="1" max="2147483647" step="1" /></label>
               <label class="field full"><span>到期时间（北京时间）<b>*</b></span><input v-model="form.expire_at" type="datetime-local" required /><small class="field-help">按北京时间生成授权到期时间。</small></label>
+              <div class="field full"><label class="reminder-create"><input v-model="form.reminder_enabled" type="checkbox" /> 开启 License 到期飞书提醒</label><small class="field-help">到期前 1 个自然月、15 天、7 天、1 天提醒申请人和最后审批人，双方可在详情修改。</small></div>
               <label class="field"><span>账号数 <b>*</b></span><input v-model.number="form.account_number" type="number" required min="-1" max="2147483647" step="1" /><small class="field-help">-1 表示不限数量。</small></label>
               <label class="field"><span>Agent 数 <b>*</b></span><input v-model.number="form.agent_number" type="number" required min="-1" max="2147483647" step="1" /><small class="field-help">-1 表示不限数量。</small></label>
               <label class="field full"><span>申请用途 <b>*</b></span><textarea v-model.trim="form.purpose" required rows="4" maxlength="10000" placeholder="说明使用场景与授权需求" /></label>
@@ -261,6 +263,7 @@ onBeforeUnmount(() => {
           <template v-else-if="detail">
             <div class="detail-topline"><span class="code-label">{{ detail.code }}</span><span class="status-tag" :class="{generated:'green',rejected:'red',in_progress:'blue'}[detail.status] || 'amber'">{{ statusLabels[detail.status] }}</span><button class="text-button license-refresh" :disabled="saving" @click="openDetail(detail.id, false)"><RefreshCw :size="14" /> 刷新详情</button></div>
             <div class="detail-section"><h3>申请信息</h3><div class="detail-grid"><div><span>关联项目</span><strong>{{ detail.project_name }}</strong><small v-if="!detail.project_id" class="field-help">历史申请 · 尚未关联项目</small></div><div><span>客户名称</span><strong>{{ detail.customer }}</strong></div><div><span>授权产品</span><strong>{{ detail.product }}</strong></div><div><span>申请人</span><strong>{{ detail.applicant_name }}</strong></div><div v-if="detail.approval_department"><span>审批归属部门</span><strong>{{detail.approval_department}}</strong><small v-if="detail.approval_department_source==='project'" class="field-help">管理员申请 · 按项目所属部门匹配审批</small></div><div><span>租户 ID</span><strong>{{ detail.tenant_id }}</strong></div><div><span>到期时间（北京时间）</span><strong>{{ dateTime(detail.expire_time) }}</strong></div><div><span>账号数</span><strong>{{ limit(detail.account_number) }}</strong></div><div><span>Agent 数</span><strong>{{ limit(detail.agent_number) }}</strong></div><div class="full"><span>申请用途</span><strong>{{ detail.purpose }}</strong></div><div><span>申请时间（北京时间）</span><strong>{{ dateTime(detail.created_at) }}</strong></div></div></div>
+            <ExpiryReminder :key="detail.id" kind="license" :item-id="detail.id" :value="detail.reminder" @updated="value => { detail.reminder = value; detail.reminder_enabled = value.enabled; load() }" />
             <div class="detail-section"><div class="detail-section-heading"><h3>License Key</h3><button v-if="detail.license_key" class="secondary-button" @click="copyKey"><Copy :size="15" /> 复制完整 Key</button></div>
               <template v-if="detail.license_key"><p class="field-help">完整授权结果包含 body 与 key，可复制用于产品授权。</p><textarea class="license-key" :value="detail.license_key" readonly rows="9" aria-label="生成的 License Key" spellcheck="false" /><p class="field-help">最终审批人：{{ detail.final_approver_name }} · 生成时间：{{ dateTime(detail.generated_at) }}（北京时间）</p></template>
               <p v-else-if="detail.status === 'generated'" class="license-key-restricted">密钥已生成，仅申请者与最终审批人可以查看。</p>

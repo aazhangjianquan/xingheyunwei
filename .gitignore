@@ -15,6 +15,7 @@ reports/pre-v3-keys-*/
 reports/profile-backups/
 reports/redis-backups/
 reports/services-backups/
+reports/reminder-backups/
 k8s-deploy/.private/
 k8s-deploy/rendered*.yaml
 

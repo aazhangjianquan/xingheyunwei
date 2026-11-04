@@ -11,3 +11,6 @@
 /* Keep the global footer at the bottom of the workspace, aligned with the sidebar profile area. */
 .app-shell{min-height:100vh}.main-area{display:flex;flex-direction:column;min-height:100vh}.content{display:flex;flex:1 0 auto;flex-direction:column;width:100%;padding-bottom:0}.content-footer{margin-top:auto;margin-bottom:18px;flex-shrink:0}.sidebar-bottom{padding-bottom:18px}.sidebar-footer{display:none}
 @media(max-width:700px){.content-footer{margin-top:28px;margin-bottom:14px}.content{padding-bottom:0}}
+
+.reminder-create { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.reminder-create input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: #2563eb; }

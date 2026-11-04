@@ -195,6 +195,10 @@ API 启动自动补齐审批字段并创建 License 流程草稿。已有未经�
 
 ## 飞书通知
 
+License 到期前 1 个自然月、15 天、7 天、1 天，通过现有飞书机器人提醒申请人与实际完成最终审批的人；资源执行完成后，在结束日期前 7 天北京时间 09:00 提醒申请人与本单实际执行的运维人员。每张申请共用一个开关，默认开启，申请人及对应处理人可在详情修改，修改记录写入业务日志；关闭后停止所有收件人的后续到期提醒。创建申请时也可关闭，驳回重提保留原设置。
+
+独立 `reminder-scheduler` 每分钟生成计划与通知，复用原 Redis 队列、Worker、飞书配置及重试入口。错过多个节点只补最近适用节点；发送前复核开关、有效期、周期和接收人，同周期已发送节点不会因重开而重复。资源历史执行人缺失时，管理员或运维负责人可在提醒区补录依据与人员。升级执行 `bash scripts/update_reminders.sh`，脚本先构建、备份数据库与主密钥，再更新 API、前端、Worker 与调度服务；也支持直接启动新版 API 自动补结构。备份在 `reports/reminder-backups/`，记录在 `reports/reminders-update.log`。
+
 管理员在「系统配置 → 飞书通知」保存企业自建应用 App ID、App Secret、平台访问地址，并启用通知。App Secret 加密写入 MySQL，留空保留已有值。平台地址用于消息中的单据链接，需填写成员能访问的地址。
 
 在飞书开放平台启用企业应用机器人、开通单聊消息权限（`im:message:send_as_bot`）并发布应用，将成员纳入应用可用范围。管理员在「用户与权限」点击成员的「配置 / 修改」，粘贴申请人、审批人或系统管理员的 `open_id`，保存后页面只显示脱敏值（例如 `ou_••••••••9abc`）。open_id 由数据库字段加密类型自动写入密文，通知发送前由 API 在内存中解密；列表、`/api/me`、审计详情和前端资源都不会返回完整值。检查应用凭据只验证鉴权，实际投递还取决于消息权限、成员身份和应用可用范围。
@@ -224,6 +228,7 @@ API 启动自动补齐审批字段并创建 License 流程草稿。已有未经�
 | database/upgrade_license.sql | 首次安装 License 管理表结构 |
 | database/upgrade_license_approval.sql | 已有 License 模块增加审批字段；旧申请补走审批 |
 | database/upgrade_license_project.sql | 已有 License 表关联项目管理；保留历史审批与密钥 |
+| database/v1.0.3.sql | License 与资源到期飞书提醒：增加开关、提醒计划、投递去重及运维责任人表 |
 | database/upgrade_audit.sql | 业务操作日志与人员、单据快照；保留原接口日志 |
 | database/upgrade_request_limits.sql | API 请求限流与管理员异常频率告警计数表 |
 | database/upgrade_feishu_open_id.sql | 扩展 open_id 存储列；新版 API 自动完成密文迁移 |

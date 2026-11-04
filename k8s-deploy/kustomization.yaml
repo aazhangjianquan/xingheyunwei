@@ -5,6 +5,7 @@ resources:
   - manifests/namespace.yaml
   - manifests/api.yaml
   - manifests/worker.yaml
+  - manifests/reminder-scheduler.yaml
   - manifests/frontend.yaml
   - manifests/redis.yaml
   - manifests/ingress.yaml

@@ -12,6 +12,7 @@ from .models import NotificationLog, User, now
 from .settings import all_values
 from .roles import has_role
 from .security import decrypt_secret, encrypt_secret, is_encrypted_secret
+from . import reminders
 
 
 def token_cache_key(app_id, app_secret):
@@ -54,8 +55,15 @@ def send_notification(log_id: int):
 
 def deliver_notification(log_id: int, *, scheduled=False):
     with SessionLocal() as db:
+        context = reminders.lock_notification_context(db, log_id)
         log = db.scalar(select(NotificationLog).where(NotificationLog.id == log_id).with_for_update())
-        if not log or log.status == 'sent':
+        if not log or log.status not in {'pending', 'failed', 'unconfigured'}:
+            return
+        invalid = reminders.invalid_reason(db, context)
+        if invalid:
+            log.status, log.error = invalid
+            log.dispatch_ready, log.next_attempt_at = False, None
+            db.commit()
             return
         if scheduled:
             if not log.dispatch_ready:
@@ -90,6 +98,9 @@ def deliver_notification(log_id: int, *, scheduled=False):
             db.commit()
             return
         try:
+            if context:
+                item, plan, _ = context
+                log.message = reminders.create_message_with_link(db, plan.object_type, item, plan, now())
             log.attempt_count += 1
             with httpx.Client(timeout=10) as client:
                 token = tenant_token(client, app_id, app_secret)

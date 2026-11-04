@@ -65,6 +65,10 @@ class ResourceRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    reminder_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
+    reminder_revision: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
+    reminder_updated_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    reminder_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ChangeRequest(Base):
@@ -184,6 +188,10 @@ class LicenseRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    reminder_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
+    reminder_revision: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
+    reminder_updated_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    reminder_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Approval(Base):
@@ -296,6 +304,47 @@ class NotificationLog(Base):
     # Existing pending rows are historical; enabling a worker must not mass-send them.
     dispatch_ready: Mapped[bool] = mapped_column(Boolean, default=True, server_default='0')
     __table_args__ = (Index('ix_notifications_dispatch', 'status', 'next_attempt_at', 'id'),)
+
+
+class ReminderPlan(Base):
+    __tablename__ = 'reminder_plans'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    object_type: Mapped[str] = mapped_column(String(30))
+    object_id: Mapped[int] = mapped_column(Integer)
+    period: Mapped[str] = mapped_column(String(100))
+    instance_id: Mapped[int | None] = mapped_column(ForeignKey('workflow_instances.id'), nullable=True)
+    rule: Mapped[str] = mapped_column(String(30))
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(String(20), default='active')
+    note: Mapped[str] = mapped_column(String(180), default='')
+    __table_args__ = (
+        UniqueConstraint('object_type', 'object_id', 'period', 'rule', name='uq_reminder_plan'),
+        Index('ix_reminder_plans_due', 'state', 'scheduled_at', 'id'),
+        Index('ix_reminder_plans_object', 'object_type', 'object_id'),
+    )
+
+
+class ReminderDelivery(Base):
+    __tablename__ = 'reminder_deliveries'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey('reminder_plans.id'), index=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    notification_id: Mapped[int] = mapped_column(ForeignKey('notification_logs.id'), unique=True)
+    __table_args__ = (UniqueConstraint('plan_id', 'recipient_id', name='uq_reminder_delivery'),)
+
+
+class ResourceReminderContact(Base):
+    __tablename__ = 'resource_reminder_contacts'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    resource_id: Mapped[int] = mapped_column(ForeignKey('resource_requests.id'), index=True)
+    instance_id: Mapped[int] = mapped_column(ForeignKey('workflow_instances.id'))
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    source_task_id: Mapped[int | None] = mapped_column(ForeignKey('approvals.id'), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default='execution')
+    reason: Mapped[str] = mapped_column(String(500), default='')
+    created_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    __table_args__ = (UniqueConstraint('resource_id', 'instance_id', 'user_id', name='uq_resource_reminder_contact'),)
 
 
 class RequestRateLimit(Base):
