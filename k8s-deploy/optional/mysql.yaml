@@ -1,0 +1,82 @@
+# Optional single-instance MySQL; production can use an external MySQL endpoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-mysql
+  namespace: project-workspace
+spec:
+  clusterIP: None
+  selector:
+    app: workspace-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: workspace-mysql
+  namespace: project-workspace
+spec:
+  serviceName: workspace-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workspace-mysql
+  template:
+    metadata:
+      labels:
+        app: workspace-mysql
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          env:
+            - name: MYSQL_DATABASE
+              value: yunweishenji
+            - name: MYSQL_USER
+              value: workspace
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: workspace-mysql-secrets
+                  key: MYSQL_PASSWORD
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: workspace-mysql-secrets
+                  key: MYSQL_ROOT_PASSWORD
+          ports:
+            - name: mysql
+              containerPort: 3306
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: '2'
+              memory: 2Gi
+          startupProbe:
+            exec:
+              command: [sh, -c, 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -u root --silent']
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: [sh, -c, 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -u root --silent']
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Set storageClassName for your cluster if necessary.
+        resources:
+          requests:
+            storage: 20Gi

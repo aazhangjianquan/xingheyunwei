@@ -1,0 +1,19 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: workspace-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: workspace-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: workspace-frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: workspace-frontend

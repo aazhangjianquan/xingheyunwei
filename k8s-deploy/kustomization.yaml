@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: project-workspace
+resources:
+  - manifests/namespace.yaml
+  - manifests/api.yaml
+  - manifests/worker.yaml
+  - manifests/frontend.yaml
+  - manifests/redis.yaml
+  - manifests/ingress.yaml
+  - manifests/network-policies.yaml
+  - manifests/disruption-budgets.yaml
+configMapGenerator:
+  - name: workspace-config
+    envs:
+      - config.env
+  - name: workspace-frontend-nginx
+    files:
+      - default.conf.template=frontend-nginx.conf
+  - name: workspace-sql
+    files:
+      - v1.0.0.sql
+      - schema.sql=v1.0.0.sql
+images:
+  - name: workspace-api-image
+    newName: registry.example.com/project-workspace/api
+    newTag: v1.0.0
+  - name: workspace-frontend-image
+    newName: registry.example.com/project-workspace/frontend
+    newTag: v1.0.0

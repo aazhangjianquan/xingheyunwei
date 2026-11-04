@@ -1,0 +1,133 @@
+name: yunweishenji
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: yunweishenji
+      MYSQL_USER: yunwei
+      MYSQL_PASSWORD: "yunwei_dev_2026"
+      MYSQL_ROOT_PASSWORD: "root_dev_2026"
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./database/demo_data.sql:/docker-entrypoint-initdb.d/02_demo_data.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --protocol=TCP -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.2.12
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+    command: ["sh", "-c", 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: "yunweishenji-api"
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: on-failure:5
+    deploy:
+      replicas: 2
+    environment: &backend_environment
+      DATABASE_URL: "mysql+pymysql://yunwei:yunwei_dev_2026@mysql:3306/yunweishenji?charset=utf8mb4"
+      # 主密钥、数据库连接配置和启动锁目录；对应下方 api_instance 持久卷。
+      INSTANCE_DIR: /app/instance
+      # 仅供系统配置页面列出、下载 SQL；对应下方 ./database 只读挂载。
+      SQL_DIR: /app/database
+      # API 与 Worker 共用 api_instance 卷，首次自动生成并共用 keys.json。
+      # 迁移旧平台必须复制该卷，不能只迁移数据库。
+      # 仅用于操作日志的真实来源 IP；请求限流与频率提醒已停用。
+      TRUSTED_PROXY_CIDRS: "172.29.90.10/32"
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+      REDIS_NAMESPACE: "project_workspace"
+      ATTACHMENT_STORAGE: minio
+      MINIO_ENDPOINT: "http://115.190.46.231:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "Agents*2026%BJ"
+      MINIO_BUCKET: "yunweishenji"
+      MINIO_REGION: "us-east-1"
+    expose:
+      - "8000"
+    volumes: &backend_volumes
+      - api_instance:/app/instance
+      - ./database:/app/database:ro
+      - ./reports:/app/reports
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+
+  worker:
+    image: "yunweishenji-api"
+    restart: unless-stopped
+    command: ["python", "-m", "app.notification_worker"]
+    environment: *backend_environment
+    volumes: *backend_volumes
+    stop_grace_period: 45s
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.notification_worker", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    environment:
+      API_UPSTREAM: "api:8000"
+      DNS_RESOLVER: "127.0.0.11"
+    ports:
+      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8008:8000"
+    networks:
+      default:
+        ipv4_address: 172.29.90.10
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.90.0/24
+
+volumes:
+  mysql_data:
+  api_instance:
+  redis_data:
+

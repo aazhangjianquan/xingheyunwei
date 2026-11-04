@@ -1,0 +1,107 @@
+name: xinghe
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: xinghe_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: "yunweishenji"
+      MYSQL_USER: "xinghe"
+      MYSQL_PASSWORD: "XingHe2026XMXZ"
+      MYSQL_ROOT_PASSWORD: "XingHe2026Root"
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", 'mysqladmin ping --protocol=TCP -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.2.12
+    container_name: xinghe_redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+    # $$ 读取上面已填写的容器内密码，不需要 .env 文件。
+    command: ["sh", "-c", 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction']
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: xinghe_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "Agents*2026%BJ"
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/minio:/data
+
+  api:
+    image: yunweishenji-api:latest
+    container_name: xinghe_api
+    restart: unless-stopped
+    # 无目录挂载；数据库连接、固定主密钥、Redis、MinIO 均在这里填写。
+    environment:
+      DATABASE_URL: "mysql+pymysql://xinghe:XingHe2026XMXZ@mysql:3306/yunweishenji?charset=utf8mb4"
+      DATABASE_CONFIG_MODE: "environment"
+      APP_SECRET: "BZ48AaIH54UAggpu2Hb0NhvAjTpfEkEKnNb-v1RUQsAeqR-jHdSOsnUixyF7RMHy"
+      FERNET_KEY: "HI3SacrrqcnC48iodlu1i1Fp7CloVA6G2rX7Ll72nmk="
+      SEED_DEMO_DATA: "false"
+      BOOTSTRAP_ADMIN_USERNAME: "admin"
+      BOOTSTRAP_ADMIN_PASSWORD: "QPMLpMuCKxJ8KqNOpY!Aa7"
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "Agents*2026%BJ"
+      MINIO_BUCKET: "yunweishenji"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+
+  worker:
+    image: yunweishenji-api:latest
+    container_name: xinghe_notification_worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.notification_worker"]
+    # 以下六项与 API 保持一致；Worker 不需要附件及管理员初始化配置。
+    environment:
+      DATABASE_URL: "mysql+pymysql://xinghe:XingHe2026XMXZ@mysql:3306/yunweishenji?charset=utf8mb4"
+      DATABASE_CONFIG_MODE: "environment"
+      APP_SECRET: "BZ48AaIH54UAggpu2Hb0NhvAjTpfEkEKnNb-v1RUQsAeqR-jHdSOsnUixyF7RMHy"
+      FERNET_KEY: "HI3SacrrqcnC48iodlu1i1Fp7CloVA6G2rX7Ll72nmk="
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_PASSWORD: "HpxXdQA20WLwxNhFLmj8NacKEKjAjY_nBmI74G5Cev8JGN_Z5BQuuTiWwh1oTLoT"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  frontend:
+    image: yunweishenji-frontend:latest
+    container_name: xinghe_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy

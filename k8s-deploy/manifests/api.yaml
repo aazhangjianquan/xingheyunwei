@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-api
+spec:
+  # Nginx resolves ready Pod IPs and retries across them during rescheduling.
+  clusterIP: None
+  selector:
+    app: workspace-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: workspace-api
+  template:
+    metadata:
+      labels:
+        app: workspace-api
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 150
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: workspace-api
+      containers:
+        - name: api
+          image: workspace-api-image
+          imagePullPolicy: IfNotPresent
+          command: [uvicorn, app.main:app, --host, '0.0.0.0', --port, '8000', --no-access-log, --no-proxy-headers]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: workspace-config
+            - secretRef:
+                name: workspace-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: '2'
+              memory: 2Gi
+              ephemeral-storage: 3Gi
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 2
+          # Readiness covers Redis; liveness must not restart every Pod on a Redis outage.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: [python, -c, 'import time; time.sleep(15)']
+          volumeMounts:
+            - name: instance
+              mountPath: /app/instance
+            - name: temp
+              mountPath: /tmp
+            - name: sql
+              mountPath: /app/database
+              readOnly: true
+      volumes:
+        - name: instance
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: temp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: sql
+          configMap:
+            name: workspace-sql

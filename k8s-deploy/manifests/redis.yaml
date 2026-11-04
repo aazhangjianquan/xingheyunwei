@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-redis
+spec:
+  clusterIP: None
+  selector:
+    app: workspace-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: workspace-redis
+spec:
+  serviceName: workspace-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workspace-redis
+  template:
+    metadata:
+      labels:
+        app: workspace-redis
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.2.12
+          command: [sh, -c]
+          args:
+            - 'exec redis-server --requirepass "$REDIS_PASSWORD" --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction --dir /data'
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: workspace-secrets
+                  key: REDIS_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: '1'
+              memory: 768Mi
+          readinessProbe:
+            exec:
+              command: [sh, -c, 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [sh, -c, 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes: []
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        # Set storageClassName here if the cluster has no suitable default class.
+        resources:
+          requests:
+            storage: 5Gi

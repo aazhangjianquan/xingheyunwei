@@ -1,0 +1,1087 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/part-of: project-workspace
+  name: project-workspace
+---
+apiVersion: v1
+data:
+  API_UPSTREAM: workspace-api:8000
+  ATTACHMENT_STORAGE: minio
+  CORS_ORIGINS: https://workspace.example.com
+  DATABASE_CONFIG_MODE: environment
+  DNS_RESOLVER: kube-dns.kube-system.svc.cluster.local
+  HOME: /tmp
+  INGRESS_PROXY_CIDR: 10.244.0.0/16
+  INSTANCE_DIR: /app/instance
+  JAVA_BIN: java
+  LICENSE_TOOL_JAR: /app/license-tool/LicenseTool-1.0-SNAPSHOT-jar-with-dependencies.jar
+  MINIO_BUCKET: yunweishenji
+  MINIO_ENDPOINT: http://115.190.46.231:9000
+  MINIO_REGION: us-east-1
+  REDIS_NAMESPACE: project_workspace_prod
+  REDIS_URL: redis://workspace-redis:6379/0
+  REQUIRE_SHARED_KEYS: "true"
+  SEED_DEMO_DATA: "false"
+  SQL_DIR: /app/database
+  TMPDIR: /tmp
+  TRUSTED_PROXY_CIDRS: 10.244.0.0/16
+  XDG_CACHE_HOME: /tmp/.cache
+kind: ConfigMap
+metadata:
+  name: workspace-config-9594dhmfmk
+  namespace: project-workspace
+---
+apiVersion: v1
+data:
+  default.conf.template: |
+    log_format workspace_safe '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status upstream=$upstream_addr';
+
+    # Only the permitted Ingress Controller may supply client addresses.
+    # NetworkPolicy is required because this CIDR may cover the cluster Pod network.
+    set_real_ip_from ${INGRESS_PROXY_CIDR};
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    resolver ${DNS_RESOLVER} valid=5s ipv6=off;
+    upstream workspace_api {
+        zone workspace_api 64k;
+        least_conn;
+        server ${API_UPSTREAM} resolve max_fails=1 fail_timeout=5s;
+        keepalive 32;
+    }
+    map $http_x_forwarded_proto $workspace_proto {
+        default $scheme;
+        http http;
+        https https;
+    }
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Proto $workspace_proto;
+    proxy_connect_timeout 1s;
+    proxy_read_timeout 120s;
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+    proxy_next_upstream_tries 3;
+    proxy_next_upstream_timeout 10s;
+    client_max_body_size 21m;
+
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+        access_log /var/log/nginx/access.log workspace_safe;
+        location = /healthz { access_log off; return 200 'ok'; }
+        location /api/ { proxy_pass http://workspace_api; }
+        location /assets/ {
+            try_files $uri =404;
+            add_header Cache-Control "public, max-age=31536000, immutable";
+        }
+        location / {
+            try_files $uri $uri/ /index.html;
+            add_header Cache-Control "no-store" always;
+            add_header Referrer-Policy "no-referrer" always;
+        }
+    }
+kind: ConfigMap
+metadata:
+  name: workspace-frontend-nginx-fd596bbmf8
+  namespace: project-workspace
+---
+apiVersion: v1
+data:
+  schema.sql: "-- 星河项目协作平台 v1.0.0 / MySQL 8.0.13+（建议 MySQL 8.4）\n-- 全新安装用纯结构 SQL：不包含测试数据、账号、密码或任何
+    INSERT。\n-- 初始管理员由 API 的 BOOTSTRAP_ADMIN_* 环境变量在首次启动时创建。\n-- 既有数据库升级/迁移应保留原数据和密钥，不将本文件当作
+    ALTER 升级脚本。\n-- CREATE TABLE IF NOT EXISTS 允许空结构安装重复执行；不会修补旧表字段。\nSET NAMES utf8mb4;\nCREATE
+    DATABASE IF NOT EXISTS `yunweishenji` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nUSE
+    `yunweishenji`;\n\nCREATE TABLE IF NOT EXISTS request_rate_limits (\n\tsubject
+    VARCHAR(80) NOT NULL, \n\tattempts TEXT NOT NULL, \n\talert_after_ms BIGINT NOT
+    NULL, \n\tupdated_ms BIGINT NOT NULL, \n\tPRIMARY KEY (subject),\n\tINDEX ix_request_rate_limits_updated_ms
+    (updated_ms)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS users (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tusername
+    VARCHAR(80) NOT NULL, \n\tdisplay_name VARCHAR(80) NOT NULL, \n\tdepartment VARCHAR(100)
+    NOT NULL, \n\t`role` VARCHAR(30) NOT NULL, \n\tpassword_hash VARCHAR(255) NOT
+    NULL, \n\tfeishu_open_id VARCHAR(500), \n\tactive BOOL NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (feishu_open_id),\n\tINDEX
+    ix_users_role (`role`),\n\tUNIQUE INDEX ix_users_username (username)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    audit_logs (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tactor_id INTEGER, \n\trecord_kind
+    VARCHAR(20) NOT NULL DEFAULT 'request', \n\tactor_name VARCHAR(80) NOT NULL DEFAULT
+    '', \n\tactor_username VARCHAR(80) NOT NULL DEFAULT '', \n\tmethod VARCHAR(10)
+    NOT NULL, \n\tpath VARCHAR(255) NOT NULL, \n\taction VARCHAR(80) NOT NULL, \n\ttarget_type
+    VARCHAR(50) NOT NULL, \n\ttarget_id VARCHAR(50) NOT NULL, \n\ttarget_code VARCHAR(80)
+    NOT NULL DEFAULT '', \n\ttarget_name VARCHAR(180) NOT NULL DEFAULT '', \n\tsummary
+    VARCHAR(600) NOT NULL DEFAULT '', \n\tchanges TEXT, \n\twiki_space_id INTEGER,
+    \n\tstatus_code INTEGER NOT NULL, \n\tip_address VARCHAR(80) NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES
+    users (id),\n\tINDEX ix_audit_logs_created_at (created_at),\n\tINDEX ix_audit_logs_kind_time
+    (record_kind, created_at, id),\n\tINDEX ix_audit_logs_wiki_space_id (wiki_space_id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS login_tickets (\n\tticket_hash VARCHAR(64) NOT NULL, \n\tuser_id
+    INTEGER NOT NULL, \n\texpires_at DATETIME NOT NULL, \n\tconsumed BOOL NOT NULL,
+    \n\tPRIMARY KEY (ticket_hash), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS notification_logs (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\trecipient_id
+    INTEGER NOT NULL, \n\tevent VARCHAR(80) NOT NULL, \n\tobject_type VARCHAR(30)
+    NOT NULL, \n\tobject_id INTEGER NOT NULL, \n\tmessage TEXT NOT NULL, \n\tstatus
+    VARCHAR(30) NOT NULL, \n\terror TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tsent_at DATETIME, \n\tattempt_count INTEGER NOT NULL DEFAULT '0', \n\tnext_attempt_at
+    DATETIME, \n\tdispatch_ready BOOL NOT NULL DEFAULT '0', \n\tPRIMARY KEY (id),
+    \n\tFOREIGN KEY(recipient_id) REFERENCES users (id),\n\tINDEX ix_notifications_dispatch
+    (status, next_attempt_at, id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS oauth_states (\n\tstate_hash VARCHAR(64) NOT NULL, \n\tbrowser_hash
+    VARCHAR(64) NOT NULL, \n\tpurpose VARCHAR(20) NOT NULL, \n\tuser_id INTEGER, \n\texpires_at
+    DATETIME NOT NULL, \n\tconsumed BOOL NOT NULL, \n\tPRIMARY KEY (state_hash), \n\tFOREIGN
+    KEY(user_id) REFERENCES users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS projects (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tname
+    VARCHAR(150) NOT NULL, \n\tdepartment VARCHAR(100) NOT NULL, \n\tactive BOOL NOT
+    NULL, \n\tcreated_by INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(created_by) REFERENCES users (id), \n\tUNIQUE (name)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS system_settings (\n\t`key` VARCHAR(80) NOT NULL, \n\tvalue TEXT
+    NOT NULL, \n\tis_secret BOOL NOT NULL, \n\tupdated_by INTEGER, \n\tupdated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (`key`), \n\tFOREIGN KEY(updated_by) REFERENCES
+    users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS user_roles (\n\tuser_id INTEGER NOT NULL, \n\t`role` VARCHAR(30)
+    NOT NULL, \n\tPRIMARY KEY (user_id, `role`), \n\tFOREIGN KEY(user_id) REFERENCES
+    users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_spaces (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\t`key`
+    VARCHAR(40) NOT NULL, \n\tname VARCHAR(120) NOT NULL, \n\tdescription VARCHAR(300)
+    NOT NULL, \n\tcreated_by INTEGER NOT NULL, \n\towner_id INTEGER, \n\tkind VARCHAR(20)
+    NOT NULL DEFAULT 'shared', \n\tcategory VARCHAR(60) NOT NULL DEFAULT '', \n\tdeleted_at
+    DATETIME, \n\tpersonal_user_id INTEGER, \n\tmembers_initialized BOOL NOT NULL
+    DEFAULT '1', \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN
+    KEY(created_by) REFERENCES users (id), \n\tFOREIGN KEY(owner_id) REFERENCES users
+    (id), \n\tFOREIGN KEY(personal_user_id) REFERENCES users (id), \n\tUNIQUE (`key`),
+    \n\tUNIQUE (personal_user_id),\n\tINDEX ix_wiki_spaces_deleted_at (deleted_at),\n\tINDEX
+    ix_wiki_spaces_owner_id (owner_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS workflow_assignments (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tobject_type VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tdepartment
+    VARCHAR(100) NOT NULL, \n\tassignee_id INTEGER NOT NULL, \n\tPRIMARY KEY (id),
+    \n\tFOREIGN KEY(assignee_id) REFERENCES users (id), \n\tCONSTRAINT uq_workflow_route
+    UNIQUE (object_type, stage, department)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_templates (\n\tkind
+    VARCHAR(30) NOT NULL, \n\tdraft TEXT NOT NULL, \n\trevision INTEGER NOT NULL,
+    \n\tupdated_by INTEGER, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (kind),
+    \n\tFOREIGN KEY(updated_by) REFERENCES users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_versions (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tkind VARCHAR(30) NOT NULL, \n\tversion INTEGER
+    NOT NULL, \n\tdefinition TEXT NOT NULL, \n\tpublished_by INTEGER, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(published_by) REFERENCES
+    users (id), \n\tCONSTRAINT uq_flow_version UNIQUE (kind, version),\n\tINDEX ix_workflow_versions_kind
+    (kind)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS change_requests (\n\tenvironment VARCHAR(30) NOT NULL, \n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER, \n\tcode VARCHAR(40)
+    NOT NULL, \n\tname VARCHAR(180) NOT NULL, \n\tchange_type VARCHAR(50) NOT NULL,
+    \n\twindow_start VARCHAR(40) NOT NULL, \n\twindow_end VARCHAR(40) NOT NULL, \n\towner_id
+    INTEGER NOT NULL, \n\tops_owner_id INTEGER, \n\tplan TEXT NOT NULL, \n\tproblem_description
+    TEXT NOT NULL, \n\trollback_plan TEXT NOT NULL, \n\timplementation TEXT NOT NULL,
+    \n\tstatus VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tdeleted_at DATETIME,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(ops_owner_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(owner_id) REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES projects
+    (id), \n\tUNIQUE (code),\n\tINDEX ix_change_requests_deleted_at (deleted_at),\n\tINDEX
+    ix_change_requests_project_id (project_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS delivery_projects (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER, \n\tcode VARCHAR(40)
+    NOT NULL, \n\tname VARCHAR(180) NOT NULL, \n\tcustomer VARCHAR(180) NOT NULL,
+    \n\towner_id INTEGER NOT NULL, \n\tcloud_type VARCHAR(30) NOT NULL, \n\tdeployment_mode
+    VARCHAR(30) NOT NULL, \n\tenvironment VARCHAR(30) NOT NULL, \n\tcompute_type VARCHAR(30)
+    NOT NULL, \n\taccelerator VARCHAR(30) NOT NULL, \n\tnetwork_notes TEXT NOT NULL,
+    \n\tdb_whitelist TEXT NOT NULL, \n\tsecurity_group TEXT NOT NULL, \n\taccount_validation
+    TEXT NOT NULL, \n\tnotes TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tstage
+    VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME
+    NOT NULL, \n\tdeleted_at DATETIME, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(owner_id)
+    REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES projects (id), \n\tUNIQUE
+    (code),\n\tINDEX ix_delivery_projects_deleted_at (deleted_at),\n\tINDEX ix_delivery_projects_project_id
+    (project_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS license_requests (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tcode VARCHAR(40) NOT NULL, \n\tapplicant_id INTEGER NOT NULL, \n\tproject_id
+    INTEGER, \n\tproject_name VARCHAR(150) NOT NULL, \n\tcustomer VARCHAR(180) NOT
+    NULL, \n\tproduct VARCHAR(150) NOT NULL, \n\ttenant_id INTEGER NOT NULL, \n\texpire_time
+    BIGINT NOT NULL, \n\taccount_number INTEGER NOT NULL, \n\tagent_number INTEGER
+    NOT NULL, \n\tpurpose TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tstage
+    VARCHAR(30) NOT NULL, \n\tfinal_approver_id INTEGER, \n\tlicense_key_ciphertext
+    TEXT, \n\tlicense_key_hash VARCHAR(64), \n\tgenerated_by INTEGER, \n\tgenerated_at
+    DATETIME, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL,
+    \n\tdeleted_at DATETIME, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(applicant_id) REFERENCES
+    users (id), \n\tFOREIGN KEY(final_approver_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(generated_by) REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES
+    projects (id), \n\tUNIQUE (code), \n\tUNIQUE (license_key_hash),\n\tINDEX ix_license_requests_applicant_id
+    (applicant_id),\n\tINDEX ix_license_requests_deleted_at (deleted_at),\n\tINDEX
+    ix_license_requests_final_approver_id (final_approver_id),\n\tINDEX ix_license_requests_project_id
+    (project_id),\n\tINDEX ix_license_requests_status (status)\n) ENGINE=InnoDB DEFAULT
+    CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS project_members
+    (\n\tproject_id INTEGER NOT NULL, \n\tuser_id INTEGER NOT NULL, \n\t`role` VARCHAR(30)
+    NOT NULL, \n\tPRIMARY KEY (project_id, user_id, `role`), \n\tFOREIGN KEY(project_id)
+    REFERENCES projects (id), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    resource_requests (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER,
+    \n\tcode VARCHAR(40) NOT NULL, \n\tproject_name VARCHAR(150) NOT NULL, \n\tapplicant_id
+    INTEGER NOT NULL, \n\tenvironment VARCHAR(30) NOT NULL, \n\tresource_type VARCHAR(80)
+    NOT NULL, \n\tspecification TEXT NOT NULL, \n\tspecification_values TEXT NOT NULL
+    DEFAULT ('{}'), \n\tstart_date VARCHAR(30) NOT NULL, \n\tend_date VARCHAR(30)
+    NOT NULL, \n\tpurpose TEXT NOT NULL, \n\tcapacity_basis TEXT NOT NULL, \n\tports
+    TEXT NOT NULL, \n\twhitelist TEXT NOT NULL, \n\tfulfillment TEXT NOT NULL, \n\tstatus
+    VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME
+    NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tdeleted_at DATETIME, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(applicant_id) REFERENCES users (id), \n\tFOREIGN KEY(project_id)
+    REFERENCES projects (id), \n\tUNIQUE (code),\n\tINDEX ix_resource_requests_deleted_at
+    (deleted_at),\n\tINDEX ix_resource_requests_project_id (project_id),\n\tINDEX
+    ix_resource_requests_project_name (project_name),\n\tINDEX ix_resource_requests_status
+    (status)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_articles (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tspace_id
+    INTEGER, \n\tparent_id INTEGER, \n\ttitle VARCHAR(180) NOT NULL, \n\tcategory
+    VARCHAR(60) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tauthor_id INTEGER NOT NULL,
+    \n\tstatus VARCHAR(20) NOT NULL, \n\tversion INTEGER NOT NULL, \n\tupdated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(author_id) REFERENCES
+    users (id), \n\tFOREIGN KEY(parent_id) REFERENCES wiki_articles (id), \n\tFOREIGN
+    KEY(space_id) REFERENCES wiki_spaces (id),\n\tINDEX ix_wiki_articles_parent_id
+    (parent_id),\n\tINDEX ix_wiki_articles_space_id (space_id),\n\tINDEX ix_wiki_articles_status
+    (status)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_space_members (\n\tspace_id INTEGER NOT NULL, \n\tuser_id
+    INTEGER NOT NULL, \n\t`role` VARCHAR(20) NOT NULL, \n\tadded_by INTEGER NOT NULL,
+    \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (space_id, user_id), \n\tFOREIGN
+    KEY(added_by) REFERENCES users (id), \n\tFOREIGN KEY(space_id) REFERENCES wiki_spaces
+    (id) ON DELETE CASCADE, \n\tFOREIGN KEY(user_id) REFERENCES users (id),\n\tINDEX
+    ix_wiki_space_members_user_id (user_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_instances (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tobject_type VARCHAR(30) NOT NULL, \n\tobject_id
+    INTEGER NOT NULL, \n\tround INTEGER NOT NULL, \n\tversion_id INTEGER, \n\tsnapshot
+    TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(version_id) REFERENCES workflow_versions
+    (id), \n\tCONSTRAINT uq_flow_round UNIQUE (object_type, object_id, round)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    change_attachments (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tchange_id INTEGER
+    NOT NULL, \n\tuploaded_by INTEGER NOT NULL, \n\tfilename VARCHAR(255) NOT NULL,
+    \n\tstorage_key VARCHAR(64) NOT NULL, \n\tstorage_backend VARCHAR(16) NOT NULL
+    DEFAULT 'local', \n\tstorage_bucket VARCHAR(63) NOT NULL DEFAULT '', \n\textension
+    VARCHAR(10) NOT NULL, \n\tcontent_type VARCHAR(100) NOT NULL, \n\tsize INTEGER
+    NOT NULL, \n\tsha256 VARCHAR(64) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(change_id) REFERENCES change_requests (id) ON DELETE
+    CASCADE, \n\tFOREIGN KEY(uploaded_by) REFERENCES users (id), \n\tUNIQUE (storage_key),\n\tINDEX
+    ix_change_attachments_change_id (change_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS delivery_attachments
+    (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdelivery_id INTEGER NOT NULL, \n\tuploaded_by
+    INTEGER NOT NULL, \n\tfilename VARCHAR(255) NOT NULL, \n\tstorage_key VARCHAR(64)
+    NOT NULL, \n\tstorage_backend VARCHAR(16) NOT NULL DEFAULT 'local', \n\tstorage_bucket
+    VARCHAR(63) NOT NULL DEFAULT '', \n\textension VARCHAR(10) NOT NULL, \n\tcontent_type
+    VARCHAR(100) NOT NULL, \n\tsize INTEGER NOT NULL, \n\tsha256 VARCHAR(64) NOT NULL,
+    \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(delivery_id)
+    REFERENCES delivery_projects (id) ON DELETE CASCADE, \n\tFOREIGN KEY(uploaded_by)
+    REFERENCES users (id), \n\tUNIQUE (storage_key),\n\tINDEX ix_delivery_attachments_delivery_id
+    (delivery_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS delivery_credentials (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tproject_id INTEGER NOT NULL, \n\tdb_type VARCHAR(30) NOT NULL, \n\thost VARCHAR(180)
+    NOT NULL, \n\tusername VARCHAR(100) NOT NULL, \n\tpassword_ciphertext TEXT NOT
+    NULL, \n\tprivilege VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(project_id) REFERENCES delivery_projects (id) ON DELETE
+    CASCADE,\n\tINDEX ix_delivery_credentials_project_id (project_id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    wiki_article_versions (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tarticle_id
+    INTEGER NOT NULL, \n\tversion INTEGER NOT NULL, \n\ttitle VARCHAR(180) NOT NULL,
+    \n\tcategory VARCHAR(60) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tstatus VARCHAR(20)
+    NOT NULL, \n\tauthor_id INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(article_id) REFERENCES wiki_articles (id) ON DELETE
+    CASCADE, \n\tFOREIGN KEY(author_id) REFERENCES users (id),\n\tINDEX ix_wiki_article_versions_article_id
+    (article_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS workflow_nodes (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tinstance_id
+    INTEGER NOT NULL, \n\tposition INTEGER NOT NULL, \n\tname VARCHAR(150) NOT NULL,
+    \n\tnode_type VARCHAR(30) NOT NULL, \n\tmode VARCHAR(10) NOT NULL, \n\tconfig
+    TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN
+    KEY(instance_id) REFERENCES workflow_instances (id), \n\tCONSTRAINT uq_instance_position
+    UNIQUE (instance_id, position),\n\tINDEX ix_workflow_nodes_instance_id (instance_id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS approvals (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tnode_run_id
+    INTEGER, \n\tassignee_snapshot TEXT NOT NULL, \n\tobject_type VARCHAR(30) NOT
+    NULL, \n\tobject_id INTEGER NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tactor_id
+    INTEGER, \n\tassignee_id INTEGER, \n\taction VARCHAR(30) NOT NULL, \n\tcomment
+    TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tacted_at DATETIME, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES users (id), \n\tFOREIGN KEY(assignee_id)
+    REFERENCES users (id), \n\tFOREIGN KEY(node_run_id) REFERENCES workflow_nodes
+    (id),\n\tINDEX ix_approvals_assignee_id (assignee_id),\n\tINDEX ix_approvals_node_run_id
+    (node_run_id),\n\tINDEX ix_approvals_object (object_type, object_id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    task_transfers (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\ttask_id INTEGER NOT
+    NULL, \n\tfrom_user_id INTEGER, \n\tto_user_id INTEGER NOT NULL, \n\tactor_id
+    INTEGER NOT NULL, \n\treason TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(from_user_id) REFERENCES users (id), \n\tFOREIGN KEY(task_id) REFERENCES approvals
+    (id), \n\tFOREIGN KEY(to_user_id) REFERENCES users (id),\n\tINDEX ix_task_transfers_task_id
+    (task_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n"
+  v1.0.0.sql: "-- 星河项目协作平台 v1.0.0 / MySQL 8.0.13+（建议 MySQL 8.4）\n-- 全新安装用纯结构 SQL：不包含测试数据、账号、密码或任何
+    INSERT。\n-- 初始管理员由 API 的 BOOTSTRAP_ADMIN_* 环境变量在首次启动时创建。\n-- 既有数据库升级/迁移应保留原数据和密钥，不将本文件当作
+    ALTER 升级脚本。\n-- CREATE TABLE IF NOT EXISTS 允许空结构安装重复执行；不会修补旧表字段。\nSET NAMES utf8mb4;\nCREATE
+    DATABASE IF NOT EXISTS `yunweishenji` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nUSE
+    `yunweishenji`;\n\nCREATE TABLE IF NOT EXISTS request_rate_limits (\n\tsubject
+    VARCHAR(80) NOT NULL, \n\tattempts TEXT NOT NULL, \n\talert_after_ms BIGINT NOT
+    NULL, \n\tupdated_ms BIGINT NOT NULL, \n\tPRIMARY KEY (subject),\n\tINDEX ix_request_rate_limits_updated_ms
+    (updated_ms)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS users (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tusername
+    VARCHAR(80) NOT NULL, \n\tdisplay_name VARCHAR(80) NOT NULL, \n\tdepartment VARCHAR(100)
+    NOT NULL, \n\t`role` VARCHAR(30) NOT NULL, \n\tpassword_hash VARCHAR(255) NOT
+    NULL, \n\tfeishu_open_id VARCHAR(500), \n\tactive BOOL NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (feishu_open_id),\n\tINDEX
+    ix_users_role (`role`),\n\tUNIQUE INDEX ix_users_username (username)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    audit_logs (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tactor_id INTEGER, \n\trecord_kind
+    VARCHAR(20) NOT NULL DEFAULT 'request', \n\tactor_name VARCHAR(80) NOT NULL DEFAULT
+    '', \n\tactor_username VARCHAR(80) NOT NULL DEFAULT '', \n\tmethod VARCHAR(10)
+    NOT NULL, \n\tpath VARCHAR(255) NOT NULL, \n\taction VARCHAR(80) NOT NULL, \n\ttarget_type
+    VARCHAR(50) NOT NULL, \n\ttarget_id VARCHAR(50) NOT NULL, \n\ttarget_code VARCHAR(80)
+    NOT NULL DEFAULT '', \n\ttarget_name VARCHAR(180) NOT NULL DEFAULT '', \n\tsummary
+    VARCHAR(600) NOT NULL DEFAULT '', \n\tchanges TEXT, \n\twiki_space_id INTEGER,
+    \n\tstatus_code INTEGER NOT NULL, \n\tip_address VARCHAR(80) NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES
+    users (id),\n\tINDEX ix_audit_logs_created_at (created_at),\n\tINDEX ix_audit_logs_kind_time
+    (record_kind, created_at, id),\n\tINDEX ix_audit_logs_wiki_space_id (wiki_space_id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS login_tickets (\n\tticket_hash VARCHAR(64) NOT NULL, \n\tuser_id
+    INTEGER NOT NULL, \n\texpires_at DATETIME NOT NULL, \n\tconsumed BOOL NOT NULL,
+    \n\tPRIMARY KEY (ticket_hash), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS notification_logs (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\trecipient_id
+    INTEGER NOT NULL, \n\tevent VARCHAR(80) NOT NULL, \n\tobject_type VARCHAR(30)
+    NOT NULL, \n\tobject_id INTEGER NOT NULL, \n\tmessage TEXT NOT NULL, \n\tstatus
+    VARCHAR(30) NOT NULL, \n\terror TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tsent_at DATETIME, \n\tattempt_count INTEGER NOT NULL DEFAULT '0', \n\tnext_attempt_at
+    DATETIME, \n\tdispatch_ready BOOL NOT NULL DEFAULT '0', \n\tPRIMARY KEY (id),
+    \n\tFOREIGN KEY(recipient_id) REFERENCES users (id),\n\tINDEX ix_notifications_dispatch
+    (status, next_attempt_at, id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS oauth_states (\n\tstate_hash VARCHAR(64) NOT NULL, \n\tbrowser_hash
+    VARCHAR(64) NOT NULL, \n\tpurpose VARCHAR(20) NOT NULL, \n\tuser_id INTEGER, \n\texpires_at
+    DATETIME NOT NULL, \n\tconsumed BOOL NOT NULL, \n\tPRIMARY KEY (state_hash), \n\tFOREIGN
+    KEY(user_id) REFERENCES users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS projects (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tname
+    VARCHAR(150) NOT NULL, \n\tdepartment VARCHAR(100) NOT NULL, \n\tactive BOOL NOT
+    NULL, \n\tcreated_by INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(created_by) REFERENCES users (id), \n\tUNIQUE (name)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS system_settings (\n\t`key` VARCHAR(80) NOT NULL, \n\tvalue TEXT
+    NOT NULL, \n\tis_secret BOOL NOT NULL, \n\tupdated_by INTEGER, \n\tupdated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (`key`), \n\tFOREIGN KEY(updated_by) REFERENCES
+    users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS user_roles (\n\tuser_id INTEGER NOT NULL, \n\t`role` VARCHAR(30)
+    NOT NULL, \n\tPRIMARY KEY (user_id, `role`), \n\tFOREIGN KEY(user_id) REFERENCES
+    users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_spaces (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\t`key`
+    VARCHAR(40) NOT NULL, \n\tname VARCHAR(120) NOT NULL, \n\tdescription VARCHAR(300)
+    NOT NULL, \n\tcreated_by INTEGER NOT NULL, \n\towner_id INTEGER, \n\tkind VARCHAR(20)
+    NOT NULL DEFAULT 'shared', \n\tcategory VARCHAR(60) NOT NULL DEFAULT '', \n\tdeleted_at
+    DATETIME, \n\tpersonal_user_id INTEGER, \n\tmembers_initialized BOOL NOT NULL
+    DEFAULT '1', \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN
+    KEY(created_by) REFERENCES users (id), \n\tFOREIGN KEY(owner_id) REFERENCES users
+    (id), \n\tFOREIGN KEY(personal_user_id) REFERENCES users (id), \n\tUNIQUE (`key`),
+    \n\tUNIQUE (personal_user_id),\n\tINDEX ix_wiki_spaces_deleted_at (deleted_at),\n\tINDEX
+    ix_wiki_spaces_owner_id (owner_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS workflow_assignments (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tobject_type VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tdepartment
+    VARCHAR(100) NOT NULL, \n\tassignee_id INTEGER NOT NULL, \n\tPRIMARY KEY (id),
+    \n\tFOREIGN KEY(assignee_id) REFERENCES users (id), \n\tCONSTRAINT uq_workflow_route
+    UNIQUE (object_type, stage, department)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_templates (\n\tkind
+    VARCHAR(30) NOT NULL, \n\tdraft TEXT NOT NULL, \n\trevision INTEGER NOT NULL,
+    \n\tupdated_by INTEGER, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (kind),
+    \n\tFOREIGN KEY(updated_by) REFERENCES users (id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_versions (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tkind VARCHAR(30) NOT NULL, \n\tversion INTEGER
+    NOT NULL, \n\tdefinition TEXT NOT NULL, \n\tpublished_by INTEGER, \n\tcreated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(published_by) REFERENCES
+    users (id), \n\tCONSTRAINT uq_flow_version UNIQUE (kind, version),\n\tINDEX ix_workflow_versions_kind
+    (kind)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS change_requests (\n\tenvironment VARCHAR(30) NOT NULL, \n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER, \n\tcode VARCHAR(40)
+    NOT NULL, \n\tname VARCHAR(180) NOT NULL, \n\tchange_type VARCHAR(50) NOT NULL,
+    \n\twindow_start VARCHAR(40) NOT NULL, \n\twindow_end VARCHAR(40) NOT NULL, \n\towner_id
+    INTEGER NOT NULL, \n\tops_owner_id INTEGER, \n\tplan TEXT NOT NULL, \n\tproblem_description
+    TEXT NOT NULL, \n\trollback_plan TEXT NOT NULL, \n\timplementation TEXT NOT NULL,
+    \n\tstatus VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tcreated_at
+    DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tdeleted_at DATETIME,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(ops_owner_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(owner_id) REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES projects
+    (id), \n\tUNIQUE (code),\n\tINDEX ix_change_requests_deleted_at (deleted_at),\n\tINDEX
+    ix_change_requests_project_id (project_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS delivery_projects (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER, \n\tcode VARCHAR(40)
+    NOT NULL, \n\tname VARCHAR(180) NOT NULL, \n\tcustomer VARCHAR(180) NOT NULL,
+    \n\towner_id INTEGER NOT NULL, \n\tcloud_type VARCHAR(30) NOT NULL, \n\tdeployment_mode
+    VARCHAR(30) NOT NULL, \n\tenvironment VARCHAR(30) NOT NULL, \n\tcompute_type VARCHAR(30)
+    NOT NULL, \n\taccelerator VARCHAR(30) NOT NULL, \n\tnetwork_notes TEXT NOT NULL,
+    \n\tdb_whitelist TEXT NOT NULL, \n\tsecurity_group TEXT NOT NULL, \n\taccount_validation
+    TEXT NOT NULL, \n\tnotes TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tstage
+    VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME
+    NOT NULL, \n\tdeleted_at DATETIME, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(owner_id)
+    REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES projects (id), \n\tUNIQUE
+    (code),\n\tINDEX ix_delivery_projects_deleted_at (deleted_at),\n\tINDEX ix_delivery_projects_project_id
+    (project_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS license_requests (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tcode VARCHAR(40) NOT NULL, \n\tapplicant_id INTEGER NOT NULL, \n\tproject_id
+    INTEGER, \n\tproject_name VARCHAR(150) NOT NULL, \n\tcustomer VARCHAR(180) NOT
+    NULL, \n\tproduct VARCHAR(150) NOT NULL, \n\ttenant_id INTEGER NOT NULL, \n\texpire_time
+    BIGINT NOT NULL, \n\taccount_number INTEGER NOT NULL, \n\tagent_number INTEGER
+    NOT NULL, \n\tpurpose TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tstage
+    VARCHAR(30) NOT NULL, \n\tfinal_approver_id INTEGER, \n\tlicense_key_ciphertext
+    TEXT, \n\tlicense_key_hash VARCHAR(64), \n\tgenerated_by INTEGER, \n\tgenerated_at
+    DATETIME, \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL,
+    \n\tdeleted_at DATETIME, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(applicant_id) REFERENCES
+    users (id), \n\tFOREIGN KEY(final_approver_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(generated_by) REFERENCES users (id), \n\tFOREIGN KEY(project_id) REFERENCES
+    projects (id), \n\tUNIQUE (code), \n\tUNIQUE (license_key_hash),\n\tINDEX ix_license_requests_applicant_id
+    (applicant_id),\n\tINDEX ix_license_requests_deleted_at (deleted_at),\n\tINDEX
+    ix_license_requests_final_approver_id (final_approver_id),\n\tINDEX ix_license_requests_project_id
+    (project_id),\n\tINDEX ix_license_requests_status (status)\n) ENGINE=InnoDB DEFAULT
+    CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS project_members
+    (\n\tproject_id INTEGER NOT NULL, \n\tuser_id INTEGER NOT NULL, \n\t`role` VARCHAR(30)
+    NOT NULL, \n\tPRIMARY KEY (project_id, user_id, `role`), \n\tFOREIGN KEY(project_id)
+    REFERENCES projects (id), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    resource_requests (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tproject_id INTEGER,
+    \n\tcode VARCHAR(40) NOT NULL, \n\tproject_name VARCHAR(150) NOT NULL, \n\tapplicant_id
+    INTEGER NOT NULL, \n\tenvironment VARCHAR(30) NOT NULL, \n\tresource_type VARCHAR(80)
+    NOT NULL, \n\tspecification TEXT NOT NULL, \n\tspecification_values TEXT NOT NULL
+    DEFAULT ('{}'), \n\tstart_date VARCHAR(30) NOT NULL, \n\tend_date VARCHAR(30)
+    NOT NULL, \n\tpurpose TEXT NOT NULL, \n\tcapacity_basis TEXT NOT NULL, \n\tports
+    TEXT NOT NULL, \n\twhitelist TEXT NOT NULL, \n\tfulfillment TEXT NOT NULL, \n\tstatus
+    VARCHAR(30) NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME
+    NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tdeleted_at DATETIME, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(applicant_id) REFERENCES users (id), \n\tFOREIGN KEY(project_id)
+    REFERENCES projects (id), \n\tUNIQUE (code),\n\tINDEX ix_resource_requests_deleted_at
+    (deleted_at),\n\tINDEX ix_resource_requests_project_id (project_id),\n\tINDEX
+    ix_resource_requests_project_name (project_name),\n\tINDEX ix_resource_requests_status
+    (status)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_articles (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tspace_id
+    INTEGER, \n\tparent_id INTEGER, \n\ttitle VARCHAR(180) NOT NULL, \n\tcategory
+    VARCHAR(60) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tauthor_id INTEGER NOT NULL,
+    \n\tstatus VARCHAR(20) NOT NULL, \n\tversion INTEGER NOT NULL, \n\tupdated_at
+    DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(author_id) REFERENCES
+    users (id), \n\tFOREIGN KEY(parent_id) REFERENCES wiki_articles (id), \n\tFOREIGN
+    KEY(space_id) REFERENCES wiki_spaces (id),\n\tINDEX ix_wiki_articles_parent_id
+    (parent_id),\n\tINDEX ix_wiki_articles_space_id (space_id),\n\tINDEX ix_wiki_articles_status
+    (status)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS wiki_space_members (\n\tspace_id INTEGER NOT NULL, \n\tuser_id
+    INTEGER NOT NULL, \n\t`role` VARCHAR(20) NOT NULL, \n\tadded_by INTEGER NOT NULL,
+    \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (space_id, user_id), \n\tFOREIGN
+    KEY(added_by) REFERENCES users (id), \n\tFOREIGN KEY(space_id) REFERENCES wiki_spaces
+    (id) ON DELETE CASCADE, \n\tFOREIGN KEY(user_id) REFERENCES users (id),\n\tINDEX
+    ix_wiki_space_members_user_id (user_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS workflow_instances (\n\tid
+    INTEGER NOT NULL AUTO_INCREMENT, \n\tobject_type VARCHAR(30) NOT NULL, \n\tobject_id
+    INTEGER NOT NULL, \n\tround INTEGER NOT NULL, \n\tversion_id INTEGER, \n\tsnapshot
+    TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(version_id) REFERENCES workflow_versions
+    (id), \n\tCONSTRAINT uq_flow_round UNIQUE (object_type, object_id, round)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    change_attachments (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tchange_id INTEGER
+    NOT NULL, \n\tuploaded_by INTEGER NOT NULL, \n\tfilename VARCHAR(255) NOT NULL,
+    \n\tstorage_key VARCHAR(64) NOT NULL, \n\tstorage_backend VARCHAR(16) NOT NULL
+    DEFAULT 'local', \n\tstorage_bucket VARCHAR(63) NOT NULL DEFAULT '', \n\textension
+    VARCHAR(10) NOT NULL, \n\tcontent_type VARCHAR(100) NOT NULL, \n\tsize INTEGER
+    NOT NULL, \n\tsha256 VARCHAR(64) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(change_id) REFERENCES change_requests (id) ON DELETE
+    CASCADE, \n\tFOREIGN KEY(uploaded_by) REFERENCES users (id), \n\tUNIQUE (storage_key),\n\tINDEX
+    ix_change_attachments_change_id (change_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS delivery_attachments
+    (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdelivery_id INTEGER NOT NULL, \n\tuploaded_by
+    INTEGER NOT NULL, \n\tfilename VARCHAR(255) NOT NULL, \n\tstorage_key VARCHAR(64)
+    NOT NULL, \n\tstorage_backend VARCHAR(16) NOT NULL DEFAULT 'local', \n\tstorage_bucket
+    VARCHAR(63) NOT NULL DEFAULT '', \n\textension VARCHAR(10) NOT NULL, \n\tcontent_type
+    VARCHAR(100) NOT NULL, \n\tsize INTEGER NOT NULL, \n\tsha256 VARCHAR(64) NOT NULL,
+    \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(delivery_id)
+    REFERENCES delivery_projects (id) ON DELETE CASCADE, \n\tFOREIGN KEY(uploaded_by)
+    REFERENCES users (id), \n\tUNIQUE (storage_key),\n\tINDEX ix_delivery_attachments_delivery_id
+    (delivery_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS delivery_credentials (\n\tid INTEGER NOT NULL AUTO_INCREMENT,
+    \n\tproject_id INTEGER NOT NULL, \n\tdb_type VARCHAR(30) NOT NULL, \n\thost VARCHAR(180)
+    NOT NULL, \n\tusername VARCHAR(100) NOT NULL, \n\tpassword_ciphertext TEXT NOT
+    NULL, \n\tprivilege VARCHAR(30) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(project_id) REFERENCES delivery_projects (id) ON DELETE
+    CASCADE,\n\tINDEX ix_delivery_credentials_project_id (project_id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    wiki_article_versions (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tarticle_id
+    INTEGER NOT NULL, \n\tversion INTEGER NOT NULL, \n\ttitle VARCHAR(180) NOT NULL,
+    \n\tcategory VARCHAR(60) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tstatus VARCHAR(20)
+    NOT NULL, \n\tauthor_id INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(article_id) REFERENCES wiki_articles (id) ON DELETE
+    CASCADE, \n\tFOREIGN KEY(author_id) REFERENCES users (id),\n\tINDEX ix_wiki_article_versions_article_id
+    (article_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE
+    TABLE IF NOT EXISTS workflow_nodes (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tinstance_id
+    INTEGER NOT NULL, \n\tposition INTEGER NOT NULL, \n\tname VARCHAR(150) NOT NULL,
+    \n\tnode_type VARCHAR(30) NOT NULL, \n\tmode VARCHAR(10) NOT NULL, \n\tconfig
+    TEXT NOT NULL, \n\tstatus VARCHAR(30) NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN
+    KEY(instance_id) REFERENCES workflow_instances (id), \n\tCONSTRAINT uq_instance_position
+    UNIQUE (instance_id, position),\n\tINDEX ix_workflow_nodes_instance_id (instance_id)\n)
+    ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE
+    IF NOT EXISTS approvals (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tnode_run_id
+    INTEGER, \n\tassignee_snapshot TEXT NOT NULL, \n\tobject_type VARCHAR(30) NOT
+    NULL, \n\tobject_id INTEGER NOT NULL, \n\tstage VARCHAR(30) NOT NULL, \n\tactor_id
+    INTEGER, \n\tassignee_id INTEGER, \n\taction VARCHAR(30) NOT NULL, \n\tcomment
+    TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tacted_at DATETIME, \n\tPRIMARY
+    KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES users (id), \n\tFOREIGN KEY(assignee_id)
+    REFERENCES users (id), \n\tFOREIGN KEY(node_run_id) REFERENCES workflow_nodes
+    (id),\n\tINDEX ix_approvals_assignee_id (assignee_id),\n\tINDEX ix_approvals_node_run_id
+    (node_run_id),\n\tINDEX ix_approvals_object (object_type, object_id)\n) ENGINE=InnoDB
+    DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n\nCREATE TABLE IF NOT EXISTS
+    task_transfers (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\ttask_id INTEGER NOT
+    NULL, \n\tfrom_user_id INTEGER, \n\tto_user_id INTEGER NOT NULL, \n\tactor_id
+    INTEGER NOT NULL, \n\treason TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL,
+    \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(actor_id) REFERENCES users (id), \n\tFOREIGN
+    KEY(from_user_id) REFERENCES users (id), \n\tFOREIGN KEY(task_id) REFERENCES approvals
+    (id), \n\tFOREIGN KEY(to_user_id) REFERENCES users (id),\n\tINDEX ix_task_transfers_task_id
+    (task_id)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;\n"
+kind: ConfigMap
+metadata:
+  name: workspace-sql-hhmtb9d7tm
+  namespace: project-workspace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-api
+  namespace: project-workspace
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+  selector:
+    app: workspace-api
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-frontend
+  namespace: project-workspace
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  selector:
+    app: workspace-frontend
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-redis
+  namespace: project-workspace
+spec:
+  clusterIP: None
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
+  selector:
+    app: workspace-redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-api
+  namespace: project-workspace
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: workspace-api
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: workspace-api
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - uvicorn
+        - app.main:app
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        - --no-access-log
+        - --no-proxy-headers
+        envFrom:
+        - configMapRef:
+            name: workspace-config-9594dhmfmk
+        - secretRef:
+            name: workspace-secrets
+        image: registry.example.com/project-workspace/api:v1.0.0
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - python
+              - -c
+              - import time; time.sleep(15)
+        livenessProbe:
+          failureThreshold: 6
+          periodSeconds: 10
+          tcpSocket:
+            port: http
+        name: api
+        ports:
+        - containerPort: 8000
+          name: http
+        readinessProbe:
+          failureThreshold: 2
+          httpGet:
+            path: /api/health
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 4
+        resources:
+          limits:
+            cpu: "2"
+            ephemeral-storage: 3Gi
+            memory: 2Gi
+          requests:
+            cpu: 250m
+            ephemeral-storage: 512Mi
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        startupProbe:
+          failureThreshold: 120
+          httpGet:
+            path: /api/health
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 4
+        volumeMounts:
+        - mountPath: /app/instance
+          name: instance
+        - mountPath: /tmp
+          name: temp
+        - mountPath: /app/database
+          name: sql
+          readOnly: true
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 150
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app: workspace-api
+        maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      volumes:
+      - emptyDir:
+          sizeLimit: 256Mi
+        name: instance
+      - emptyDir:
+          sizeLimit: 2Gi
+        name: temp
+      - configMap:
+          name: workspace-sql-hhmtb9d7tm
+        name: sql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-frontend
+  namespace: project-workspace
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: workspace-frontend
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: workspace-frontend
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: workspace-config-9594dhmfmk
+        image: registry.example.com/project-workspace/frontend:v1.0.0
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - sleep 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 10
+        name: frontend
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/nginx/templates
+          name: template
+          readOnly: true
+        - mountPath: /etc/nginx/conf.d
+          name: generated-config
+        - mountPath: /var/cache/nginx
+          name: cache
+        - mountPath: /var/run
+          name: run
+        - mountPath: /tmp
+          name: temp
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 150
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app: workspace-frontend
+        maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      volumes:
+      - configMap:
+          name: workspace-frontend-nginx-fd596bbmf8
+        name: template
+      - emptyDir: {}
+        name: generated-config
+      - emptyDir: {}
+        name: cache
+      - emptyDir: {}
+        name: run
+      - emptyDir: {}
+        name: temp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-worker
+  namespace: project-workspace
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: workspace-worker
+  template:
+    metadata:
+      labels:
+        app: workspace-worker
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - python
+        - -m
+        - app.notification_worker
+        envFrom:
+        - configMapRef:
+            name: workspace-config-9594dhmfmk
+        - secretRef:
+            name: workspace-secrets
+        image: registry.example.com/project-workspace/api:v1.0.0
+        imagePullPolicy: IfNotPresent
+        name: worker
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -m
+            - app.notification_worker
+            - --healthcheck
+          periodSeconds: 10
+          timeoutSeconds: 4
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        startupProbe:
+          exec:
+            command:
+            - python
+            - -m
+            - app.notification_worker
+            - --healthcheck
+          failureThreshold: 120
+          periodSeconds: 5
+          timeoutSeconds: 4
+        volumeMounts:
+        - mountPath: /app/instance
+          name: instance
+        - mountPath: /tmp
+          name: temp
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - emptyDir:
+          sizeLimit: 32Mi
+        name: instance
+      - emptyDir:
+          sizeLimit: 128Mi
+        name: temp
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: workspace-redis
+  namespace: project-workspace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workspace-redis
+  serviceName: workspace-redis
+  template:
+    metadata:
+      labels:
+        app: workspace-redis
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - args:
+        - exec redis-server --requirepass "$REDIS_PASSWORD" --appendonly yes --appendfsync
+          everysec --maxmemory 256mb --maxmemory-policy noeviction --dir /data
+        command:
+        - sh
+        - -c
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: REDIS_PASSWORD
+              name: workspace-secrets
+        image: redis:7.2.12
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -q PONG
+          failureThreshold: 6
+          periodSeconds: 10
+        name: redis
+        ports:
+        - containerPort: 6379
+          name: redis
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -q PONG
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: "1"
+            memory: 768Mi
+          requests:
+            cpu: 100m
+            memory: 384Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /data
+          name: data
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      volumes: []
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 5Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: workspace-api
+  namespace: project-workspace
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: workspace-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: workspace-frontend
+  namespace: project-workspace
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: workspace-frontend
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 21m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  name: workspace
+  namespace: project-workspace
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: workspace.example.com
+    http:
+      paths:
+      - backend:
+          service:
+            name: workspace-frontend
+            port:
+              number: 80
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - workspace.example.com
+    secretName: workspace-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-frontend
+  namespace: project-workspace
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: workspace-frontend
+    ports:
+    - port: 8000
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: workspace-api
+  policyTypes:
+  - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-from-ingress
+  namespace: project-workspace
+spec:
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - port: 8080
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: workspace-frontend
+  policyTypes:
+  - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-from-backend
+  namespace: project-workspace
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: workspace-api
+    - podSelector:
+        matchLabels:
+          app: workspace-worker
+    ports:
+    - port: 6379
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: workspace-redis
+  policyTypes:
+  - Ingress

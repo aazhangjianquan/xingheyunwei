@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: workspace-frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: workspace-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace-frontend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: workspace-frontend
+  template:
+    metadata:
+      labels:
+        app: workspace-frontend
+        app.kubernetes.io/part-of: project-workspace
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 150
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: workspace-frontend
+      containers:
+        - name: frontend
+          image: workspace-frontend-image
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: workspace-config
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: [/bin/sh, -c, 'sleep 10']
+          volumeMounts:
+            - name: template
+              mountPath: /etc/nginx/templates
+              readOnly: true
+            - name: generated-config
+              mountPath: /etc/nginx/conf.d
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+            - name: temp
+              mountPath: /tmp
+      volumes:
+        - name: template
+          configMap:
+            name: workspace-frontend-nginx
+        - name: generated-config
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: temp
+          emptyDir: {}
