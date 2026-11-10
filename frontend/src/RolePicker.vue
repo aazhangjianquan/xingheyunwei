@@ -7,16 +7,18 @@ const query = ref('')
 const descriptions = {
     applicant: '提交申请，跟踪自己的业务进度', admin: '管理成员、平台配置和审批流程', license_manager: '查看并管理全部 License 申请', knowledge_admin: '参与知识库协作；内容访问仍由空间负责人授权',
   department_head: '按所属部门审核申请', ops_head: '统筹运维审核与资源安排', manager: '参与业务决策与审批', operator: '执行运维任务与交付回填', tester: '验证功能、变更结果与交付质量',
-  commercial_head: '管理本部门销售/售前成员', project_manager_head: '管理本部门项目经理成员', technical_head: '管理本部门产品开发成员', agent_development_head: '管理本部门智能体开发成员',
   sales_presales: '负责客户需求、方案与商务协同', project_manager: '协调项目交付与成员分工', agent_developer: '负责智能体方案与开发交付', product_developer: '负责产品功能与技术实现',
 }
 const aliasMap = { leader: 'manager', project_owner: 'project_manager', project_director: 'project_manager_head', sales_head: 'commercial_head', sales_director: 'commercial_head', development_head: 'technical_head' }
+const retiredRoles = new Set(['commercial_head', 'project_manager_head', 'technical_head', 'agent_development_head'])
+const systemRoles = new Set(['admin', 'applicant', 'license_manager', 'knowledge_admin'])
+const visibleRoles = computed(() => props.roles.filter(r => systemRoles.has(r.id)))
 const groups = computed(() => {
-  const names = ['基础与系统', '审批与执行', '项目与业务']
-  return names.map(name => ({ name, items: props.roles.filter(r => r.group === name && (!query.value || (r.name + (descriptions[r.id] || '')).includes(query.value.trim()))) }))
+  const names = ['基础与系统']
+  return names.map(name => ({ name, items: visibleRoles.value.filter(r => r.group === name && (!query.value || (r.name + (descriptions[r.id] || '')).includes(query.value.trim()))) }))
 })
-const selected = computed(() => props.roles.filter(role => isSelected(role.id)))
-function locked(id) { return props.disabled || (props.editableIds !== null && !props.editableIds.includes(id)) }
+const selected = computed(() => visibleRoles.value.filter(role => isSelected(role.id)))
+function locked(id) { return props.disabled || !systemRoles.has(id) || id === 'department_head' || retiredRoles.has(aliasMap[id] || id) || props.roles.find(r=>r.id===id)?.assignment_source==='department' || (props.editableIds !== null && !props.editableIds.includes(id)) }
 function toggle(id) {
   if (locked(id)) return
   emit('update:modelValue', isSelected(id) ? props.modelValue.filter(r => r !== id && aliasMap[r] !== id) : [...props.modelValue, id])
@@ -26,10 +28,10 @@ function isSelected(id) { return props.modelValue.includes(id) || props.modelVal
 <template>
   <div class="role-picker">
     <div class="role-picker-head"><div><ShieldCheck :size="17" /><strong>角色与权限</strong><span>可多选</span></div><span class="role-selected-count">已选 {{ selected.length }} 项</span></div>
-    <p class="role-picker-help">按实际职责分配多个角色。负责人按所属部门关联，可参与部门审批并管理对应岗位。<template v-if="editableIds !== null">灰色角色由系统管理员维护。</template></p>
+    <p class="role-picker-help">这里只分配基础与系统角色。业务权限由部门岗位授予，部门负责人在部门管理中任命并分配成员岗位。<template v-if="editableIds !== null">灰色角色由系统管理员维护。</template></p>
     <div class="role-selected" aria-label="已选角色"><span v-for="role in selected" :key="role.id" class="role-token">{{ role.name }}<button type="button" :disabled="locked(role.id)" :aria-label="'移除' + role.name" @click="toggle(role.id)"><X :size="12" /></button></span><span v-if="!selected.length" class="role-none">至少选择一个角色</span></div>
     <label class="role-search"><Search :size="15" /><input v-model="query" :disabled="disabled" placeholder="搜索角色名称或职责" aria-label="搜索可选角色" /></label>
-    <div class="role-groups"><fieldset v-for="group in groups.filter(g => g.items.length)" :key="group.name" :disabled="disabled"><legend>{{ group.name }}</legend><div class="role-card-grid"><label v-for="role in group.items" :key="role.id" class="role-card" :class="{ checked: isSelected(role.id), privileged: role.id === 'admin', locked: locked(role.id) }"><input type="checkbox" :disabled="locked(role.id)" :checked="isSelected(role.id)" @change="toggle(role.id)" /><span class="role-card-check"><Check v-if="isSelected(role.id)" :size="12" /></span><span class="role-card-text"><strong>{{ role.name }}</strong><small>{{ descriptions[role.id] || '参与对应岗位的业务协作' }}</small><span v-if="role.department_scoped" class="role-scope">本部门 · 负责人</span></span></label></div></fieldset><p v-if="!groups.some(g => g.items.length)" class="role-none">{{ roles.length ? '没有匹配的角色' : '正在加载角色目录…' }}</p></div>
+    <div class="role-groups"><fieldset v-for="group in groups.filter(g => g.items.length)" :key="group.name" :disabled="disabled"><legend>{{ group.name }}</legend><div class="role-card-grid"><label v-for="role in group.items" :key="role.id" class="role-card" :class="{ checked: isSelected(role.id), privileged: role.id === 'admin', locked: locked(role.id) }"><input type="checkbox" :disabled="locked(role.id)" :checked="isSelected(role.id)" @change="toggle(role.id)" /><span class="role-card-check"><Check v-if="isSelected(role.id)" :size="12" /></span><span class="role-card-text"><strong>{{ role.name }}</strong><small>{{ descriptions[role.id] || '参与对应岗位的业务协作' }}</small><span v-if="role.assignment_source==='department'" class="role-scope">在部门管理中任命</span><span v-if="role.department_scoped" class="role-scope">本部门 · 负责人</span></span></label></div></fieldset><p v-if="!groups.some(g => g.items.length)" class="role-none">{{ roles.length ? '没有匹配的角色' : '正在加载角色目录…' }}</p></div>
   </div>
 </template>
 <style scoped>

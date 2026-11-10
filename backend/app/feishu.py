@@ -13,6 +13,8 @@ from .settings import all_values
 from .roles import has_role
 from .security import decrypt_secret, encrypt_secret, is_encrypted_secret
 from . import reminders
+from . import personal_reminders
+from .notification_cards import message_content
 
 
 def token_cache_key(app_id, app_secret):
@@ -55,11 +57,12 @@ def send_notification(log_id: int):
 
 def deliver_notification(log_id: int, *, scheduled=False):
     with SessionLocal() as db:
+        personal_context = personal_reminders.lock_notification_context(db, log_id)
         context = reminders.lock_notification_context(db, log_id)
         log = db.scalar(select(NotificationLog).where(NotificationLog.id == log_id).with_for_update())
         if not log or log.status not in {'pending', 'failed', 'unconfigured'}:
             return
-        invalid = reminders.invalid_reason(db, context)
+        invalid = personal_reminders.invalid_reason(db, personal_context) or reminders.invalid_reason(db, context)
         if invalid:
             log.status, log.error = invalid
             log.dispatch_ready, log.next_attempt_at = False, None
@@ -97,11 +100,15 @@ def deliver_notification(log_id: int, *, scheduled=False):
             log.error = "飞书应用凭据或收件人 open_id 未配置"
             db.commit()
             return
+        message_type, error_code = 'text', None
         try:
+            stamp = now()
             if context:
                 item, plan, _ = context
-                log.message = reminders.create_message_with_link(db, plan.object_type, item, plan, now())
+                log.message = reminders.create_message_with_link(db, plan.object_type, item, plan, stamp)
             log.attempt_count += 1
+            # 卡片与审计原文使用同一时刻；发送失败走原重试预算，不额外补发另一条消息。
+            message_type, content = message_content(log, settings, context=context, stamp=stamp)
             with httpx.Client(timeout=10) as client:
                 token = tenant_token(client, app_id, app_secret)
                 open_id = decrypt_secret(user.feishu_open_id) if is_encrypted_secret(user.feishu_open_id) else user.feishu_open_id
@@ -109,13 +116,15 @@ def deliver_notification(log_id: int, *, scheduled=False):
                     "https://open.feishu.cn/open-apis/im/v1/messages",
                     params={"receive_id_type": "open_id"},
                     headers={"Authorization": f"Bearer {token}"},
-                    json={"receive_id": open_id, "msg_type": "text", "content": json.dumps({"text": log.message}, ensure_ascii=False),
+                    json={"receive_id": open_id, "msg_type": message_type, "content": json.dumps(content, ensure_ascii=False),
                           'uuid': str(uuid5(NAMESPACE_URL, f'{app_id}:{log.id}:{log.created_at.isoformat()}'))},
                 )
                 response.raise_for_status()
                 data = response.json()
                 if data.get("code") != 0:
-                    raise RuntimeError(data.get("msg", "飞书发送失败"))
+                    code = str(data.get('code', ''))
+                    error_code = code if code.isascii() and code.isdecimal() and len(code) <= 12 else None
+                    raise RuntimeError('飞书发送失败')
             log.status = "sent"
             log.error = ''
             log.sent_at = now()
@@ -123,6 +132,10 @@ def deliver_notification(log_id: int, *, scheduled=False):
         except Exception:
             log.status = "failed"
             log.error = "飞书发送失败，请检查应用权限、open_id、可用范围及网络后重试"
+            if message_type == 'interactive':
+                log.error += '；本次为卡片消息，请同时检查卡片格式及飞书客户端版本'
+            if error_code:
+                log.error += f'（错误码 {error_code}）'
             log.next_attempt_at = now() + timedelta(seconds=30 * log.attempt_count) if log.attempt_count < 3 else None
             if redis_runtime.configured():
                 try:

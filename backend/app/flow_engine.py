@@ -7,11 +7,14 @@ Snapshots are immutable; pending task assignment changes have a separate history
 import json
 from fastapi import HTTPException
 from sqlalchemy import select, func
+from . import organization as org
+from . import project_positions as pp
 from .models import (User, Approval, Project, ProjectMember, WorkflowTemplate,
                      WorkflowVersion, WorkflowInstance, WorkflowNode, now)
 from .roles import (ROLES, FLOW_ROLES, PROJECT_ROLES, has_role, role_ids,
                     canonical_role, role_aliases, stored_role_ids, managed_roles,
-                    has_department_role, retained_snapshot_roles, role_name)
+                    has_department_role, has_legacy_approval_role, retained_snapshot_roles, role_name,
+                    RETIRED_HEAD_ROLES, is_department_manager)
 
 KINDS = {'resource', 'change', 'delivery', 'license'}
 FIELDS = {
@@ -43,6 +46,10 @@ def normalize_definition(definition):
             source = node.get('assignee')
             if isinstance(source, dict) and isinstance(source.get('role'), str):
                 source['role'] = canonical_role(source['role'])
+                if source.get('source') == 'project_role' and source['role'] == 'department_head':
+                    source['role'] = 'technical_lead'
+                if source['role'] in RETIRED_HEAD_ROLES:
+                    source.update(source='department_role', role='department_head')
             for arm in node.get('branches', []) if isinstance(node.get('branches', []), list) else []:
                 if isinstance(arm, dict):
                     walk(arm.get('steps'))
@@ -50,6 +57,98 @@ def normalize_definition(definition):
         walk(result.get('steps'))
     return result
 
+
+
+def department_first_definition(definition):
+    """The first review is a platform rule, shared by publishing and submission."""
+    result = normalize_definition(definition)
+    if not isinstance(result, dict) or not isinstance(result.get('steps'), list):
+        return result
+    steps = result['steps']
+    first = steps[0] if steps and isinstance(steps[0], dict) else {}
+    replacement = {'id': 'organization_department_review', 'name': '部门负责人审批',
+                   'type': 'approval', 'mode': 'any',
+                   'assignee': {'source': 'organization_manager'}}
+    if first.get('type') == 'approval':
+        steps[0] = replacement
+    else:
+        steps.insert(0, replacement)
+    # Legacy/custom node ids cannot shadow the reserved first-review id.
+    def rename(nodes):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node is not replacement and node.get('id') == replacement['id']:
+                node['id'] = 'legacy_' + node['id']
+            arms = node.get('branches', [])
+            for arm in arms if isinstance(arms, list) else []:
+                if isinstance(arm, dict) and isinstance(arm.get('steps'), list):
+                    rename(arm['steps'])
+    rename(steps)
+    return result
+
+
+def application_department(db, owner, selected_id):
+    departments = {key: d for key, d in org.member_departments(owner).items() if d.active}
+    if selected_id is None and len(departments) == 1:
+        return next(iter(departments.values()))
+    if type(selected_id) is not int or selected_id not in departments:
+        fail('请选择本人已加入的启用部门作为本次申请部门；没有可选部门时请联系管理员', 422)
+    return departments[selected_id]
+
+
+def organization_reviewers(db, owner, department_id):
+    """Nearest eligible managers, then independent admins; never self approval."""
+    selected = db.get(org.Department, department_id)
+    if not selected:
+        fail('本次申请部门不存在，请重新选择', 409)
+    # 共同负责人本人提单也直接上移，不交给同级其他负责人。
+    applicant_is_manager = any(m.user_id == owner.id for m in selected.managers)
+    if applicant_is_manager:
+        selected = db.get(org.Department, selected.parent_id) if selected.parent_id else None
+    seen = {department_id} if applicant_is_manager else set()
+    while selected and selected.id not in seen:
+        seen.add(selected.id)
+        people = [db.get(User, m.user_id) for m in selected.managers] if selected.active else []
+        people = [p for p in people if p and p.active and p.id != owner.id and is_department_manager(p, selected.id)]
+        if people:
+            return [{'id': p.id, 'name': p.display_name, 'required_role': 'department_head',
+                     'department_id': selected.id, 'department': selected.name,
+                     'organization_manager': True, 'roles': role_ids(p)} for p in people]
+        selected = db.get(org.Department, selected.parent_id) if selected.parent_id else None
+    people = [p for p in db.scalars(select(User).where(User.active == True).order_by(User.id))
+              if p.id != owner.id and has_role(p, 'admin')]
+    if not people:
+        fail('未找到独立审批人：本部门及上级部门没有可用负责人，也没有其他启用的系统管理员。请先任命部门负责人或补齐独立管理员，再提交；申请人不能审批本人申请', 409)
+    return [{'id': p.id, 'name': p.display_name, 'required_role': 'admin', 'admin_fallback': True,
+             'roles': role_ids(p)} for p in people]
+
+
+def upgrade_department_first_approval(db):
+    from .models import SystemSetting
+    marker = 'organization_position_approval_v107'
+    db.flush()
+    if db.get(SystemSetting, marker):
+        return
+    unconfigured = []
+    for kind in sorted(KINDS):
+        template = db.get(WorkflowTemplate, kind)
+        if not template:
+            continue
+        published = db.scalar(select(WorkflowVersion).where(WorkflowVersion.kind == kind).order_by(WorkflowVersion.version.desc()))
+        # 草稿可能尚未完成；仅锁首审，不替管理员填写后续审批人。
+        template.draft = dump(department_first_definition(json.loads(template.draft)))
+        template.revision += 1
+        if published:
+            definition = department_first_definition(json.loads(published.definition))
+            try:
+                validate(kind, definition)
+            except HTTPException:
+                # 空安装没有运维/最终审批人，不发布无效新版本，也不阻断平台初始化。
+                unconfigured.append(kind)
+                continue
+            db.add(WorkflowVersion(kind=kind, version=published.version + 1, definition=dump(definition)))
+    db.add(SystemSetting(key=marker, value=dump({'unconfigured_kinds': unconfigured}), is_secret=False))
 
 def owner_id(kind, obj):
     return obj.applicant_id if kind in {'resource', 'license'} else obj.owner_id
@@ -116,8 +215,10 @@ def validate(kind, definition):
                 source = node.get('assignee', {})
                 if not isinstance(source, dict):
                     fail('处理人配置无效')
-                if source.get('source') not in {'fixed', 'project_role', 'department_role'}:
+                if source.get('source') not in {'fixed', 'project_role', 'department_role', 'organization_manager'}:
                     fail('处理人来源无效')
+                if source['source'] == 'organization_manager' and (depth or node is not steps[0] or kind_ != 'approval' or node.get('mode') != 'any'):
+                    fail('部门负责人统一审批必须是第一个节点，并使用任意一人同意')
                 if source['source'] == 'fixed':
                     if not isinstance(source.get('user_ids'), list) or not source['user_ids'] or not all(type(i) is int and i > 0 for i in source['user_ids']):
                         fail('固定成员至少选择一人')
@@ -125,6 +226,10 @@ def validate(kind, definition):
                     fail('请选择有效项目岗位')
                 elif source.get('source') == 'department_role' and canonical_role(source.get('role')) not in FLOW_ROLES:
                     fail('请选择有效部门岗位')
+                if source.get('department_scope', 'current') not in {'current', 'parent', 'auto'}:
+                    fail('部门审批范围无效')
+                if source.get('department_scope') == 'parent' and (source.get('source') != 'department_role' or source.get('role') != 'department_head'):
+                    fail('上一级部门审批仅支持部门负责人')
                 if kind_ == 'execution' and (source.get('source') != 'fixed' and canonical_role(source.get('role')) != 'operator'):
                     fail('执行节点的岗位必须为运维人员')
                 if node.get('mode') == 'quorum':
@@ -151,18 +256,18 @@ def project_scope(query, user, management=False):
         return query
     ids = select(ProjectMember.project_id).where(
         ProjectMember.user_id == user.id,
-        ProjectMember.role.in_(stored_role_ids(user))
+        ProjectMember.role.in_(set(PROJECT_ROLES) | {'project_owner', 'sales_presales', 'department_head'})
     )
     if management and managed_roles(user) and user.department.strip():
-        return query.where((Project.id.in_(ids)) | (Project.department == user.department))
+        return query.where((Project.id.in_(ids)) | org.department_scope(Project, user))
     return query.where(Project.id.in_(ids))
 
 
 def project_manage_roles(project, user, members):
     if has_role(user, 'admin'):
         return set(PROJECT_ROLES)
-    roles = managed_roles(user) if user.department.strip() and user.department == project.department else set()
-    if any(m.user_id == user.id and canonical_role(m.role) == 'project_manager' and has_role(user, m.role) for m in members):
+    roles = managed_roles(user) if org.same_department(user, project) else set()
+    if any(m.user_id == user.id and canonical_role(m.role) == 'project_manager' for m in members):
         roles |= set(PROJECT_ROLES) - {'project_manager'}
     return roles
 
@@ -172,7 +277,7 @@ def project_access(db, project_id, user, manage=False):
     if not project:
         fail('项目不存在', 404)
     members = db.scalars(select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id)).all()
-    eligible = [m for m in members if has_role(user, canonical_role(m.role))]
+    eligible = [m for m in members if pp.migrated_positions(m.role)]
     authorized = bool(project_manage_roles(project, user, members)) if manage else bool(eligible)
     if not has_role(user, 'admin') and not authorized:
         fail('无权管理或申请此项目', 403)
@@ -180,19 +285,17 @@ def project_access(db, project_id, user, manage=False):
 
 
 def resolve(db, kind, definition, data, owner, project_id, check_access=True):
-    definition = normalize_definition(definition)
+    definition = department_first_definition(definition)
     validate(kind, definition)
     project = project_access(db, project_id, owner) if check_access else db.get(Project, project_id)
     if not project or not project.active:
         fail('关联项目不存在或已停用', 409)
-    # Administrators apply across projects without acquiring each project's
-    # membership or adopting its staff department in their personal profile.
-    # Their business department comes from the chosen project; approval still
-    # requires an eligible person other than the applicant.
-    department_source = 'project' if has_role(owner, 'admin') else 'applicant'
-    department = project.department if department_source == 'project' else owner.department
+    selected_department = application_department(db, owner, data.get('application_department_id'))
+    department_source = 'selected_membership'
+    department, department_id = selected_department.name, selected_department.id
     context = {k: data.get(k, '') for k in FIELDS[kind]}
     context['department'] = department
+    context['department_id'] = department_id
     path, branches = [], []
     def walk(steps):
         for node in steps:
@@ -202,7 +305,16 @@ def resolve(db, kind, definition, data, owner, project_id, check_access=True):
                     matches = []
                     for c in arm.get('conditions', []):
                         value = context.get(c['field'], '')
-                        matches.append(value == c['value'] if c['op'] == 'eq' else (value in c['value'] if c['op'] == 'in' else value not in c['value']))
+                        expected = c['value']
+                        if c['field'] == 'department' and department_id is not None:
+                            def identity(label):
+                                if str(label).startswith('department:'):
+                                    return str(label)
+                                found = org.find_department(db, label)
+                                return f'department:{found.id}' if found else str(label)
+                            value = f'department:{department_id}'
+                            expected = identity(expected) if c['op'] == 'eq' else [identity(v) for v in expected]
+                        matches.append(value == expected if c['op'] == 'eq' else (value in expected if c['op'] == 'in' else value not in expected))
                     if chosen is None and (arm.get('default') or (all(matches) if arm.get('match') == 'all' else any(matches))):
                         chosen = arm['id']
                 branches.append({'id': node['id'], 'name': node['name'], 'matched': chosen,
@@ -210,6 +322,10 @@ def resolve(db, kind, definition, data, owner, project_id, check_access=True):
                 walk(next(a['steps'] for a in node['branches'] if a['id'] == chosen))
                 continue
             source = node['assignee']
+            approval_department_id, approval_department = department_id, department
+            if source['source'] == 'organization_manager':
+                path.append({**node, 'required_count': None, 'assignees': organization_reviewers(db, owner, department_id)})
+                continue
             if source['source'] == 'fixed':
                 people = [db.get(User, uid) for uid in dict.fromkeys(source['user_ids'])]
             elif source['source'] == 'project_role':
@@ -218,29 +334,39 @@ def resolve(db, kind, definition, data, owner, project_id, check_access=True):
             else:
                 if not department.strip():
                     fail(f"节点「{node['name']}」缺少审批归属部门，请先配置{'项目所属部门' if department_source == 'project' else '申请人所属部门'}", 409)
-                people = db.scalars(select(User).where(User.department == department).order_by(User.id)).all()
-                if canonical_role(source.get('role')) == 'department_head':
-                    # Respect an explicitly assigned department head. Functional
-                    # heads provide the fallback for departments without one,
-                    # so upgrading does not add approvers to an existing route.
-                    explicit = [person for person in people if person.active and person.id != owner.id and has_role(person, 'department_head')]
-                    if explicit:
-                        people = explicit
+                organization_manager = canonical_role(source.get('role')) == 'department_head'
+                if organization_manager:
+                    selected = db.get(org.Department, department_id) if department_id is not None else org.find_department(db, department)
+                    routing_scope = source.get('department_scope', 'auto')
+                    parent_scope = routing_scope == 'parent' or routing_scope == 'auto' and not path
+                    if selected and parent_scope and selected.parent_id is not None:
+                        selected = db.get(org.Department, selected.parent_id)
+                    if not selected or not selected.active:
+                        fail(f"节点「{node['name']}」对应的{'上一级' if parent_scope else ''}部门不存在或已停用，请检查组织架构", 409)
+                    approval_department_id, approval_department = selected.id, selected.name
+                scope = org.membership_filter(User, {approval_department_id}) if approval_department_id is not None else User.department == approval_department
+                people = db.scalars(select(User).where(scope).order_by(User.id)).all()
+                if organization_manager:
+                    people = [person for person in people if is_department_manager(person, approval_department_id)]
             members = []
             for person in people:
                 if not person or not person.active or person.id == owner.id:
                     continue
                 required = source.get('role') if source['source'] != 'fixed' else ('operator' if node['type'] == 'execution' else None)
-                matches = has_department_role(person, required) if source['source'] == 'department_role' else has_role(person, required)
+                matches = source['source'] in {'fixed', 'project_role'} or has_role(person, required)
                 if required and not matches:
                     continue
                 members.append({'id': person.id, 'name': person.display_name, 'required_role': required,
-                                'department': department if source['source'] == 'department_role' else None,
-                                'roles': role_ids(person)})
+                                'department': approval_department if source['source'] == 'department_role' else None,
+                                'department_id': approval_department_id if source['source'] == 'department_role' else None,
+                                'organization_manager': source['source'] == 'department_role' and required == 'department_head',
+                                'roles': role_ids(person),
+                                'assignment_policy': {'source': source['source'], 'project_id': project_id, 'role': required, 'owner_id': owner.id} if source['source'] in {'fixed','project_role'} else None})
             if not members:
-                label = role_name(source['role']) if source.get('role') else '固定成员'
+                label = pp.POSITIONS.get(source.get('role'), role_name(source['role'])) if source.get('role') else '固定成员'
                 if source['source'] == 'department_role':
-                    scope = f'项目「{project.name}」所属部门「{department}」' if department_source == 'project' else f'申请人所属部门「{department}」'
+                    origin = f'项目「{project.name}」所属部门「{department}」' if department_source == 'project' else f'申请人所属部门「{department}」'
+                    scope = origin + f'匹配的审批部门「{approval_department}」'
                     fail(f"审批配置不完整：节点「{node['name']}」在{scope}没有合格处理人：{label}。请为该部门配置已启用且具有对应角色的成员；审批人不能是申请人本人", 409)
                 if node['type'] == 'license_approval' and any(person and person.id == owner.id for person in people):
                     fail('License 最终审批人不能是申请人本人，请在审批流程中指定另一位已启用的成员并发布', 409)
@@ -267,7 +393,11 @@ def activate(db, kind, obj, node):
     obj.stage = 'operator' if node.node_type == 'execution' else config['id'][:30]
     if not config['assignees']:
         fail('旧版流程缺少后续处理人，请管理员检查升级前审批配置', 409)
-    for person in config['assignees']:
+    available = [p for p in config['assignees'] if p['id'] != owner_id(kind, obj) and snapshot_eligible(db.get(User, p['id']), p, json.loads(node.assignment_policy) if node.assignment_policy else None)]
+    required = len(config['assignees']) if node.mode == 'all' else 1 if node.mode == 'any' else int(config.get('required_count') or 0)
+    if len(available) < required:
+        fail('后续节点处理人已失效，请管理员转交或恢复对应岗位后再处理', 409)
+    for person in available:
         db.add(Approval(object_type=kind, object_id=obj.id, stage=obj.stage, node_run_id=node.id,
                         assignee_id=person['id'], assignee_snapshot=dump(person)))
     db.flush()
@@ -279,13 +409,16 @@ def start(db, kind, obj, owner):
     data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns
             if c.name not in {'license_key_ciphertext', 'license_key_hash'}}
     snapshot = resolve(db, kind, json.loads(version.definition), data, owner, getattr(obj, 'project_id', None))
+    obj.application_department_id = snapshot['context']['department_id']
     round_ = (db.scalar(select(func.max(WorkflowInstance.round)).where(WorkflowInstance.object_type == kind, WorkflowInstance.object_id == obj.id)) or 0) + 1
     instance = WorkflowInstance(object_type=kind, object_id=obj.id, round=round_, version_id=version.id, snapshot=dump(snapshot))
     db.add(instance)
     db.flush()
     nodes = []
     for i, spec in enumerate(snapshot['path']):
-        node = WorkflowNode(instance_id=instance.id, position=i, name=spec['name'], node_type=spec['type'], mode=spec['mode'], config=dump(spec))
+        node = WorkflowNode(instance_id=instance.id, position=i, name=spec['name'], node_type=spec['type'], mode=spec['mode'], config=dump(spec),
+                            assignment_policy=dump({'source':spec['assignee']['source'], 'project_id':getattr(obj,'project_id',None),
+                                'role':spec['assignee'].get('role'), 'owner_id':owner.id}) if spec['assignee']['source'] in {'fixed','project_role'} else None)
         db.add(node)
         nodes.append(node)
     db.flush()
@@ -297,15 +430,80 @@ def start(db, kind, obj, owner):
 def eligible(user, task):
     if not user or not user.active or task.assignee_id != user.id:
         return False
-    snap = json.loads(task.assignee_snapshot or '{}')
-    # Fixed assignees also retain their grant at submission; removing an original
-    # grant blocks stale tasks. Role-based assignees require the exact role.
-    matches = has_department_role(user, snap['required_role']) if snap.get('department') and snap.get('required_role') else has_role(user, snap.get('required_role'))
+    return snapshot_eligible(user, json.loads(task.assignee_snapshot or '{}'), pp.task_policy(task))
+
+
+def snapshot_eligible(user, snap, policy=None):
+    policy = policy or snap.get('assignment_policy')
+    if policy:
+        return pp.policy_eligible(user, policy)
+    if not user or not user.active:
+        return False
+    matches = snapshot_role_matches(user, snap)
     if snap.get('required_role') and not matches:
         return False
     if not snap.get('required_role') and snap.get('roles') and not retained_snapshot_roles(user, snap['roles']):
         return False
-    return not snap.get('department') or user.department == snap['department']
+    return org.snapshot_department_matches(user, snap)
+
+
+def snapshot_role_matches(user, snapshot):
+    """New appointments are strict; historical tasks retain only their old identity."""
+    required = snapshot.get('required_role')
+    if snapshot.get('organization_manager'):
+        return required == 'department_head' and is_department_manager(user, snapshot.get('department_id'))
+    return has_department_role(user, required) if snapshot.get('department') else has_legacy_approval_role(user, required)
+
+
+def upgrade_organization_approval_defaults(db):
+    """Publish the new first-step default once, preserving all published history."""
+    from .models import SystemSetting
+    # 初始化可能刚添加尚未刷新的默认流程，先保证查询可见。
+    db.flush()
+    marker = 'organization_unified_management_v2'
+    if db.get(SystemSetting, marker):
+        return
+    def upgraded(raw):
+        definition = normalize_definition(json.loads(raw))
+        steps = definition.setdefault('steps', [])
+        if not isinstance(steps, list):
+            return definition
+        first = steps[0] if steps and isinstance(steps[0], dict) else {}
+        source = first.get('assignee', {})
+        if first.get('type') == 'approval' and source.get('source') == 'department_role' and source.get('role') == 'department_head':
+            source.setdefault('department_scope', 'parent')
+            if first.get('name') in {'部门负责人', '部门审核'}:
+                first['name'] = '上级部门负责人'
+        else:
+            used = set()
+            def collect(nodes):
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    used.add(node.get('id'))
+                    for arm in node.get('branches', []) if isinstance(node.get('branches', []), list) else []:
+                        if isinstance(arm, dict) and isinstance(arm.get('steps'), list):
+                            collect(arm['steps'])
+            collect(steps)
+            key = 'organization_parent_head'
+            while key in used:
+                key += '_'
+            steps.insert(0, {'id': key, 'name': '上级部门负责人', 'type': 'approval', 'mode': 'any',
+                'assignee': {'source': 'department_role', 'role': 'department_head', 'department_scope': 'parent'}})
+        return definition
+    for kind in sorted(KINDS):
+        template = db.get(WorkflowTemplate, kind)
+        published = db.scalar(select(WorkflowVersion).where(WorkflowVersion.kind == kind).order_by(WorkflowVersion.version.desc())) if template else None
+        if not template or not published:
+            continue
+        # 已发布版本保持原样，新规则另存版本；在途实例继续原快照。
+        definition = upgraded(published.definition)
+        db.add(WorkflowVersion(kind=kind, version=published.version + 1, definition=dump(definition)))
+        # 管理员正在编辑的草稿可以不完整；仅同步尚未另行修改的原发布内容。
+        if json.loads(template.draft) == json.loads(published.definition):
+            template.draft = dump(definition)
+            template.revision += 1
+    db.add(SystemSetting(key=marker, value='true', is_secret=False))
 
 
 def act(db, kind, obj, task_id, user, action, comment, fulfillment, plan='', rollback_plan=''):
@@ -316,7 +514,7 @@ def act(db, kind, obj, task_id, user, action, comment, fulfillment, plan='', rol
     if task.action != 'pending' or obj.status not in {'pending', 'in_progress'}:
         fail('任务已处理或已关闭，请刷新', 409)
     if owner_id(kind, obj) == user.id or not eligible(user, task):
-        fail('无权处理此任务；角色撤销或账号停用后需管理员转交', 403)
+        fail('无权处理此任务；任命撤销或账号停用后需管理员转交', 403)
     node = db.scalar(select(WorkflowNode).where(WorkflowNode.id == task.node_run_id).with_for_update().execution_options(populate_existing=True))
     if not node or node.status != 'pending':
         fail('节点状态已变化', 409)

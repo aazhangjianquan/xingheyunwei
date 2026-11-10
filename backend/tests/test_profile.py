@@ -14,7 +14,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import AuditLog, User, UserRole
 from app.rate_limit import RateDecision
-from app.roles import ROLES
+from app.roles import ROLES, RETIRED_HEAD_ROLES
 from app.security import hash_password, make_token, verify_password
 
 
@@ -69,7 +69,9 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()['id'], uid)
                 self.assertEqual(response.json()['display_name'], '修改后的姓名')
-                self.assertEqual(set(response.json()['roles']), set(grants))
+                effective = set(grants) - RETIRED_HEAD_ROLES - {'department_head'}
+                self.assertEqual(set(response.json()['roles']), effective)
+                self.assertEqual(set(response.json()['direct_roles']), set(grants))
                 self.assertEqual(response.json()['username'], username)
                 wrong = self.client.post('/api/me/password', headers=headers,
                     json={'current_password': 'incorrect-password', 'new_password': self.new_password})
@@ -81,7 +83,7 @@ class ProfileTests(unittest.TestCase):
                 login = self.client.post('/api/login', json={'username': username, 'password': self.new_password})
                 self.assertEqual(login.status_code, 200, login.text)
                 self.assertEqual(login.json()['user']['display_name'], '修改后的姓名')
-                self.assertEqual(set(login.json()['user']['roles']), set(grants))
+                self.assertEqual(set(login.json()['user']['roles']), effective)
                 with self.sessions() as db:
                     rows = db.scalars(select(AuditLog).where(AuditLog.record_kind == 'business', AuditLog.actor_id == uid)).all()
                     self.assertEqual({row.action for row in rows}, {'update', 'change_password'})

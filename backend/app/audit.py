@@ -12,10 +12,11 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, defer
 
 from .database import get_db
-from .models import AuditLog, Project, ProjectMember, User, WorkflowInstance, WorkflowNode, WikiSpace
+from .models import AuditLog, Project, ProjectMember, User, WorkflowInstance, WorkflowNode, WikiSpace, WikiSpaceDepartment, WikiSpaceMember, Department
 from .roles import ROLES, role_ids, role_name
 
 TYPES = {'resource': '资源申请', 'change': '变更申请', 'delivery': '私有化交付',
+         'department': '部门', 'department_position': '部门岗位',
          'license': 'License 申请', 'project': '项目', 'user': '成员',
          'wiki': '知识文章', 'wiki_space': '知识空间', 'workflow': '审批流程', 'settings': '系统配置', 'notification': '通知'}
 ACTIONS = {'create': '创建', 'update': '修改', 'delete': '删除', 'restore': '恢复', 'resubmit': '修改并重新提交',
@@ -27,7 +28,8 @@ ACTIONS = {'create': '创建', 'update': '修改', 'delete': '删除', 'restore'
            'change_password': '修改本人密码', 'upload_attachment': '上传交付附件',
            'download_attachment': '下载交付附件', 'preview_attachment': '预览交付附件'}
 LABELS = dict(
-    project='关联项目', name='名称', project_name='项目名称', customer='客户', product='授权产品',
+    parent_id='上级部门', approval_mode='负责人匹配方式', manager_assignable='允许负责人分配',
+    application_department='本次申请部门', project='关联项目', name='名称', project_name='项目名称', customer='客户', product='授权产品',
     tenant_id='租户 ID', expire_time='授权到期时间', account_number='账号数', agent_number='Agent 数',
     purpose='申请用途', environment='环境', resource_type='资源类型', specification='资源规格',
     start_date='开始日期', end_date='结束日期', capacity_basis='容量依据', ports='端口', whitelist='白名单',
@@ -44,18 +46,22 @@ LABELS = dict(
     feishu_app_id='飞书 App ID', feishu_app_secret='飞书 App Secret',
     feishu_notifications_enabled='飞书通知', local_login_enabled='账号密码登录',
     feishu_login_enabled='飞书登录', feishu_tenant_key='飞书租户', database='数据库连接',
-    key='空间标识', description='空间说明', owner_id='空间负责人', kind='访问范围',
+    feishu_task_login_enabled='飞书任务免密',
+    access_scope='开放范围', include_subdepartments='包含下级部门', access_departments='开放部门', access_members='直接授权人员',
+    key='空间标识', description='空间说明', owner_id='空间负责人', kind='空间类型',
     resource_catalog='资源类型与规格配置',
     reminder_enabled='到期提醒', reminder_contact='资源提醒运维人员',
 )
 FIELDS = {
+    'department': 'name parent_id active description approval_mode',
+    'department_position': 'name active manager_assignable',
     'resource': 'environment resource_type specification start_date end_date purpose capacity_basis ports whitelist status stage reminder_enabled',
     'change': 'name environment change_type window_start window_end ops_owner_id problem_description plan rollback_plan status stage',
     'delivery': 'name customer cloud_type deployment_mode environment compute_type accelerator network_notes db_whitelist security_group account_validation notes status stage',
     'license': 'customer product tenant_id expire_time account_number agent_number purpose status stage reminder_enabled',
     'project': 'name department active', 'user': 'username display_name department active',
     'wiki': 'title category status version',
-    'wiki_space': 'key name description category kind owner_id',
+    'wiki_space': 'key name description category kind owner_id access_scope include_subdepartments',
 }
 STATUS = {'pending': '待审批', 'in_progress': '处理中', 'completed': '已完成', 'generated': '已生成',
           'rejected': '已驳回', 'awaiting_workflow': '待补充审批'}
@@ -67,6 +73,8 @@ def snapshot(db, kind, obj):
     result = {key: getattr(obj, key) for key in FIELDS.get(kind, '').split()}
     if kind == 'wiki': result['_body_digest'] = hashlib.sha256(obj.content.encode()).hexdigest()
     if kind in {'resource', 'change', 'delivery', 'license'}:
+        selected = db.get(Department, obj.application_department_id) if obj.application_department_id else None
+        result['application_department'] = f'{selected.name} (#{selected.id})' if selected else '历史记录未选择'
         project = db.get(Project, obj.project_id) if obj.project_id else None
         result['project'] = f'{project.name} (#{project.id})' if project else getattr(obj, 'project_name', '')
         node_name = db.scalar(select(WorkflowNode.name).join(WorkflowInstance, WorkflowNode.instance_id == WorkflowInstance.id)
@@ -78,6 +86,11 @@ def snapshot(db, kind, obj):
     if kind == 'user':
         result.update(roles=sorted({role_name(r) for r in role_ids(obj)}),
                       feishu_open_id='已设置' if obj.feishu_open_id else '未设置')
+    if kind == 'department':
+        people = db.scalars(select(User).where(User.id.in_([m.user_id for m in obj.managers]))).all()
+        result['members'] = sorted(f'{p.display_name}（{p.username}）' for p in people)
+    if kind == 'department_position':
+        result['roles'] = sorted(r.role for r in obj.role_grants)
     if kind == 'project':
         rows = db.execute(select(ProjectMember.user_id, ProjectMember.role, User.display_name, User.username)
                           .join(User, User.id == ProjectMember.user_id)
@@ -86,6 +99,9 @@ def snapshot(db, kind, obj):
     if result.get('ops_owner_id'):
         person = db.get(User, result['ops_owner_id'])
         result['ops_owner_id'] = f'{person.display_name}（{person.username}）' if person else '未指定'
+    if kind == 'wiki_space':
+        result['access_departments'] = sorted(f'{name}（#{did}）' for did, name in db.execute(select(Department.id, Department.name).join(WikiSpaceDepartment, WikiSpaceDepartment.department_id == Department.id).where(WikiSpaceDepartment.space_id == obj.id)))
+        result['access_members'] = sorted(f"{name}（{username}）：{ {'viewer': '只读', 'editor': '编辑'}.get(role, role)}" for name, username, role in db.execute(select(User.display_name, User.username, WikiSpaceMember.role).join(WikiSpaceMember, WikiSpaceMember.user_id == User.id).where(WikiSpaceMember.space_id == obj.id)))
     if kind == 'wiki_space' and result.get('owner_id'):
         person = db.get(User, result['owner_id'])
         result['owner_id'] = f'{person.display_name}（{person.username}）' if person else '未指定'
@@ -93,7 +109,9 @@ def snapshot(db, kind, obj):
 
 
 def safe_value(field, value):
-    if field == 'kind': return {'personal': '仅自己', 'shared': '指定成员'}.get(value, value)
+    if field == 'access_scope': return {'all': '所有人', 'departments': '指定部门', 'members': '指定人员'}.get(value, value)
+    if field == 'include_subdepartments': return '包含' if value else '不包含'
+    if field == 'kind': return {'personal': '个人知识库', 'shared': '共享知识库'}.get(value, value)
     if field in SECRET_FIELDS:
         # Callers pass a marker; no raw value is retained, even accidentally.
         return '未设置' if value in (None, '', False, '未设置') else '已设置 / 已更新'

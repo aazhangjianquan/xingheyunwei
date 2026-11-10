@@ -16,6 +16,7 @@ from .models import (Approval, LicenseRequest, NotificationLog, ReminderDelivery
     WorkflowNode, now)
 from .notifications import create_notification
 from .roles import has_role
+from . import project_positions as pp
 
 BEIJING = timezone(timedelta(hours=8))
 MODELS = {'license': LicenseRequest, 'resource': ResourceRequest}
@@ -92,6 +93,25 @@ def recipients(db, kind, item, instance=None, *, save=False):
     return ids
 
 
+def resource_operator(db, item, person):
+    if not person or not person.active:
+        return False
+    if pp.appointed(person,item.project_id,'operator'):
+        return True
+    instance=latest_instance(db,'resource',item)
+    tasks=execution_tasks(db,instance,completed=item.status=='completed')
+    for task in tasks:
+        if (task.actor_id if item.status=='completed' else task.assignee_id) != person.id:
+            continue
+        policy=pp.task_policy(task)
+        if not policy or policy.get('source')=='fixed':
+            return True
+    # 无关联项目的历史补录沿用明确联系人，不再借助全局运维角色扩大范围。
+    return bool(not item.project_id and instance and db.scalar(select(ResourceReminderContact.id).where(
+        ResourceReminderContact.resource_id==item.id,ResourceReminderContact.instance_id==instance.id,
+        ResourceReminderContact.user_id==person.id)))
+
+
 def can_edit(db, kind, item, user, instance=None):
     if not user or not user.active or item.deleted_at is not None:
         return False
@@ -99,7 +119,7 @@ def can_edit(db, kind, item, user, instance=None):
         return True
     if kind == 'license':
         return item.status == 'generated' and item.final_approver_id == user.id
-    if not has_role(user, 'operator'):
+    if not resource_operator(db,item,user):
         return False
     instance = instance or latest_instance(db, kind, item)
     if item.status == 'completed':
@@ -215,7 +235,7 @@ def schedule_due(db, kind, item, plans, stamp=None):
             log = db.scalar(select(NotificationLog).where(NotificationLog.id == delivery.notification_id).with_for_update())
             # Never make automatic scanning reset an exhausted retry budget.
             person = db.get(User, uid)
-            role_valid = kind != 'resource' or uid == item.applicant_id or (person and has_role(person, 'operator'))
+            role_valid = kind != 'resource' or uid == item.applicant_id or (person and resource_operator(db,item,person))
             if log.status in {'cancelled', 'unconfigured'} and log.attempt_count < 3 and role_valid and configured_for(db, person):
                 log.status, log.error, log.dispatch_ready = 'pending', '', True
                 log.message = create_message_with_link(db, kind, item, current, stamp)
@@ -269,18 +289,19 @@ def invalid_reason(db, context, stamp=None):
         return 'cancelled', '收件人已不再负责此单据'
     person = db.get(User, delivery.recipient_id)
     if plan.object_type == 'resource' and delivery.recipient_id != item.applicant_id and (
-            not person or not has_role(person, 'operator')):
-        return 'unconfigured', '资源收件人已不具备运维角色，请核对责任人'
+            not person or not resource_operator(db,item,person)):
+        return 'unconfigured', '资源收件人已不再是本项目运维人员，请核对项目任命'
     return None
 
 
 def info(db, kind, item, user=None):
+    stamp = now()
     instance = latest_instance(db, kind, item)
     people_ids = recipients(db, kind, item, instance)
     people = list(db.scalars(select(User).where(User.id.in_(people_ids)).order_by(User.id)))
     try:
         expiry, rules = dates(kind, item)
-        effective = is_effective(kind, item) and expiry > now()
+        effective = is_effective(kind, item) and expiry > stamp
         period = period_key(instance, expiry)
     except (ValueError, OverflowError, OSError):
         effective, rules, period = False, [], None
@@ -288,33 +309,61 @@ def info(db, kind, item, user=None):
         ReminderDelivery.notification_id == NotificationLog.id).join(ReminderPlan, ReminderDelivery.plan_id == ReminderPlan.id)
         .where(ReminderPlan.object_type == kind, ReminderPlan.object_id == item.id)
         .order_by(NotificationLog.id.desc()).limit(20)))
-    stamp = now()
     due = [(rule, at) for rule, at in rules if at <= stamp]
     current_rule = max(due, key=lambda p: p[1])[0] if due else None
-    next_at = None
+    next_at, next_rule, current_delivery = None, None, None
     if effective and item.reminder_enabled:
-        sent_to = set(db.scalars(select(NotificationLog.recipient_id).join(ReminderDelivery,
-            ReminderDelivery.notification_id == NotificationLog.id).join(ReminderPlan,
-            ReminderDelivery.plan_id == ReminderPlan.id).where(ReminderPlan.object_type == kind,
-            ReminderPlan.object_id == item.id, ReminderPlan.period == period,
-            ReminderPlan.rule == current_rule, NotificationLog.status == 'sent')))
-        if current_rule and people_ids - sent_to:
-            next_at = stamp
-        else:
-            next_at = min((at for _, at in rules if at > stamp), default=None)
+        # The next business milestone is independent of overdue deliveries.
+        # Never manufacture a scheduled time from a GET request's wall clock.
+        future = [(rule, at) for rule, at in rules if at > stamp]
+        if future:
+            next_rule, next_at = min(future, key=lambda entry: entry[1])
+        if current_rule:
+            current_logs = {log.recipient_id: log for log in db.scalars(select(NotificationLog)
+                .join(ReminderDelivery, ReminderDelivery.notification_id == NotificationLog.id)
+                .join(ReminderPlan, ReminderDelivery.plan_id == ReminderPlan.id)
+                .where(ReminderPlan.object_type == kind, ReminderPlan.object_id == item.id,
+                    ReminderPlan.period == period, ReminderPlan.rule == current_rule))}
+            channel_ready = bool(settings.value(db, 'feishu_notifications_enabled') and
+                settings.value(db, 'feishu_app_id') and settings.value(db, 'feishu_app_secret'))
+            delivery_people = []
+            for person in people:
+                log = current_logs.get(person.id)
+                state, error, retry_at = 'awaiting_scan', '', None
+                if log and log.status == 'sent':
+                    state = 'sent'
+                elif not person.active:
+                    state, error = 'unconfigured', '账号已停用'
+                elif kind == 'resource' and person.id != item.applicant_id and not resource_operator(db,item,person):
+                    state, error = 'unconfigured', '运维权限已变更'
+                elif not person.feishu_open_id:
+                    state, error = 'unconfigured', '未配置飞书'
+                elif not channel_ready:
+                    state, error = 'unconfigured', '系统飞书通知未启用或应用配置不完整'
+                elif log and log.status == 'cancelled':
+                    # A reopened reminder may await the next scheduler pass.
+                    state = 'awaiting_scan'
+                elif log:
+                    state, error, retry_at = log.status, log.error, log.next_attempt_at
+                delivery_people.append({'id': person.id, 'name': person.display_name,
+                    'status': state, 'error': error, 'next_attempt_at': iso(retry_at)})
+            current_delivery = {'rule': LABELS[current_rule],
+                'scheduled_at': iso(next(at for rule, at in rules if rule == current_rule)),
+                'recipients': delivery_people}
     editor = db.get(User, item.reminder_updated_by) if item.reminder_updated_by else None
     names = {p.id: p.display_name for p in people}
     missing_ops = kind == 'resource' and item.status == 'completed' and not resource_people(db, item, instance)
     return {'enabled': item.reminder_enabled, 'revision': item.reminder_revision,
         'can_edit': can_edit(db, kind, item, user, instance), 'effective': effective,
         'rules': [LABELS[r] for r, _ in rules], 'next_at': iso(next_at),
+        'next_rule': LABELS.get(next_rule), 'current_delivery': current_delivery,
         'updated_by_name': editor.display_name if editor else None, 'updated_at': iso(item.reminder_updated_at),
         'missing_operator': missing_ops,
         'channel_enabled': bool(settings.value(db, 'feishu_notifications_enabled')),
         'can_fill_contacts': bool(user and kind == 'resource' and instance and item.status == 'completed'
-            and has_role(user, 'admin', 'ops_head') and not execution_tasks(db, instance, completed=True)),
+            and (has_role(user, 'admin') or pp.appointed(user,item.project_id,'ops_head')) and not execution_tasks(db, instance, completed=True)),
         'recipients': [{'id': p.id, 'name': p.display_name, 'active': p.active,
-            'configured': bool(p.feishu_open_id), 'role_valid': kind != 'resource' or p.id == item.applicant_id or has_role(p, 'operator')}
+            'configured': bool(p.feishu_open_id), 'role_valid': kind != 'resource' or p.id == item.applicant_id or resource_operator(db,item,p)}
             for p in people],
         'records': [{'id': l.id, 'recipient_id': l.recipient_id, 'recipient_name': names.get(l.recipient_id, '原责任人'),
             'rule': LABELS.get(l.event, l.event), 'status': l.status, 'error': l.error,
@@ -369,6 +418,9 @@ def register_routes(app, current_user):
             raise HTTPException(403, '只有申请人和本单据的有效处理人可以修改提醒')
         if item.reminder_revision != data.expected_revision:
             raise HTTPException(409, '提醒设置已被其他人修改，请刷新后重试')
+        if item.reminder_enabled == data.enabled:
+            # An unchanged save must not touch metadata, audit or delivery state.
+            return info(db, kind, item, user)
         before = audit.snapshot(db, kind, item)
         set_enabled(item, data.enabled, user)
         plans = sync_plans(db, kind, item)
@@ -383,7 +435,7 @@ def register_routes(app, current_user):
         if not info(db, 'resource', item, user)['can_fill_contacts']:
             raise HTTPException(403, '仅管理员或运维负责人可以补录缺失的历史运维责任人')
         return [{'id': p.id, 'name': p.display_name} for p in db.scalars(select(User).where(User.active.is_(True)))
-            if has_role(p, 'operator') and p.id != item.applicant_id]
+            if (not item.project_id or resource_operator(db,item,p)) and p.id != item.applicant_id]
 
     @app.patch('/api/resource/{item_id}/reminder/contacts')
     def fill_contacts(item_id: int, data: ReminderContactsIn, db=Depends(get_db), user=Depends(current_user)):
@@ -393,8 +445,8 @@ def register_routes(app, current_user):
         instance = latest_instance(db, 'resource', item)
         people = list(db.scalars(select(User).where(User.id.in_(set(data.user_ids)))))
         if len(people) != len(set(data.user_ids)) or any(
-                not p.active or not has_role(p, 'operator') or p.id == item.applicant_id for p in people):
-            raise HTTPException(400, '请选择已启用且具备运维角色的人员，不能指定申请人本人')
+                not p.active or (item.project_id and not resource_operator(db,item,p)) or p.id == item.applicant_id for p in people):
+            raise HTTPException(400, '请选择已启用的运维责任人；关联项目的单据须选择项目运维岗位人员，且不能指定申请人本人')
         previous = list(db.scalars(select(ResourceReminderContact).where(
             ResourceReminderContact.resource_id == item.id, ResourceReminderContact.instance_id == instance.id)))
         before_ids = {c.user_id for c in previous}

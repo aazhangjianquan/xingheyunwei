@@ -45,6 +45,11 @@ class WorkflowNotificationTests(unittest.TestCase):
                 user = User(username=name, display_name=name + '姓名', department='测试部门', role=role,
                             role_grants=[UserRole(role=role)], password_hash='unused', feishu_open_id='ou_' + name)
                 db.add(user); db.flush(); self.ids[name] = user.id
+            from app import organization as org
+            from app.models import DepartmentManager
+            org.seed_organization(db)
+            department_id=db.get(User,self.ids['owner']).department_id
+            db.add_all([DepartmentManager(department_id=department_id,user_id=self.ids[name]) for name in ['first']])
             project = Project(name='通知测试项目', department='测试部门', created_by=self.ids['admin'])
             db.add(project); db.flush(); self.project_id = project.id
             db.add(ProjectMember(project_id=project.id, user_id=self.ids['owner'], role='applicant'))
@@ -125,7 +130,7 @@ class WorkflowNotificationTests(unittest.TestCase):
                 self.assertEqual([(l.event,l.recipient_id) for l in logs], [('submitted',self.ids['owner']),('approval_required',self.ids['first'])])
                 self.assertIn('下一位处理人：first姓名', logs[0].message)
                 self.assertIn('申请人：owner姓名', logs[1].message)
-                self.assertIn('业务初审', logs[1].message)
+                self.assertIn('部门负责人审批', logs[1].message)
                 self.assertIn(item['code'], logs[0].message)
                 self.assertIn('https://ops.example.com/', logs[0].message)
                 self.assertEqual(self.action(kind,item_id,'first').status_code,200)
@@ -148,22 +153,40 @@ class WorkflowNotificationTests(unittest.TestCase):
                 messages = '\n'.join(l.message for l in logs)
                 for secret in ['private-body','private-key','敏感回填']:
                     self.assertNotIn(secret,messages)
+                # 从真实生成的全生命周期记录验证投递格式；所有 HTTP 调用均为模拟飞书。
+                from app.feishu import deliver_notification
+                with patch('app.feishu.SessionLocal',self.sessions), \
+                        patch('app.feishu.redis_runtime.configured',return_value=False), \
+                        patch('app.feishu.httpx.Client') as transport:
+                    sender=transport.return_value.__enter__.return_value
+                    sender.post.return_value.json.return_value={'code':0,'tenant_access_token':'test-token'}
+                    for log in logs:
+                        deliver_notification(log.id)
+                        payload=sender.post.call_args.kwargs['json']
+                        self.assertEqual(payload['msg_type'],'interactive',log.event)
+                        card=json.loads(payload['content'])
+                        self.assertEqual(card['schema'],'2.0')
+                        self.assertIn(item['code'],json.dumps(card,ensure_ascii=False))
+                        with self.sessions() as db:
+                            self.assertEqual(db.get(NotificationLog,log.id).message,log.message)
 
     def test_countersign_does_not_resend_to_pending_reviewers(self):
         with self.sessions() as db:
-            db.scalar(select(WorkflowVersion).where(WorkflowVersion.kind=='license')).definition = json.dumps(self.definition('license',countersign=True))
+            definition=self.definition('license',countersign=True)
+            definition['steps'].insert(0,{'id':'organization','name':'部门负责人审批','type':'approval','mode':'any','assignee':{'source':'organization_manager'}})
+            db.scalar(select(WorkflowVersion).where(WorkflowVersion.kind=='license')).definition=json.dumps(definition)
             db.commit()
-        item, _ = self.create()
-        logs = self.logs('license',item['id'])
-        self.assertEqual(len(logs),3)
-        self.assertIn('first姓名、second姓名', logs[0].message)
+        item,_=self.create()
         self.assertEqual(self.action('license',item['id'],'first').status_code,200)
-        logs = self.logs('license',item['id'])
-        self.assertEqual(len(logs),4)
+        logs=self.logs('license',item['id']);before=len(logs)
+        self.assertIn('first姓名、second姓名',logs[-3].message)
+        self.assertEqual(self.action('license',item['id'],'first').status_code,200)
+        logs=self.logs('license',item['id'])
+        self.assertEqual(len(logs),before+1)
         self.assertEqual(logs[-1].recipient_id,self.ids['owner'])
         self.assertIn('下一位处理人：second姓名',logs[-1].message)
         self.assertEqual(self.action('license',item['id'],'second').status_code,200)
-        self.assertEqual(len(self.logs('license',item['id'])),6)
+        self.assertEqual(len(self.logs('license',item['id'])),before+3)
 
     def test_reject_resubmit_and_transfer_update_the_applicant(self):
         item, body = self.create()
@@ -176,6 +199,8 @@ class WorkflowNotificationTests(unittest.TestCase):
         result = self.client.post(f'/api/licenses/{item_id}/resubmit',headers=self.headers['owner'],json=body)
         self.assertEqual(result.status_code,200,result.text)
         with self.sessions() as db:
+            from app.models import DepartmentManager
+            owner=db.get(User,self.ids['owner']);db.add(DepartmentManager(department_id=owner.department_id,user_id=self.ids['replacement']));db.commit()
             task_id = db.scalar(select(Approval.id).where(Approval.object_type=='license',Approval.object_id==item_id,Approval.action=='pending'))
         result = self.client.post(f'/api/admin/tasks/{task_id}/reassign',headers=self.headers['admin'],
                                   json={'assignee_id':self.ids['replacement'],'reason':'处理人调整'})
@@ -199,7 +224,11 @@ class WorkflowNotificationTests(unittest.TestCase):
             self.assertEqual(sender.post.call_count,2)
             sent = sender.post.call_args.kwargs['json']
             self.assertEqual(sent['receive_id'],'ou_owner')
-            self.assertIn('下一位处理人：first姓名',json.loads(sent['content'])['text'])
+            self.assertEqual(sent['msg_type'],'interactive')
+            card=json.loads(sent['content'])
+            self.assertEqual(card['header']['title']['content'],'已提交 · License 授权')
+            self.assertIn('下一位处理人',json.dumps(card,ensure_ascii=False))
+            self.assertIn('first姓名',json.dumps(card,ensure_ascii=False))
         with self.sessions() as db:
             self.assertEqual(db.get(NotificationLog,log.id).status,'sent')
             db.get(SystemSetting,'feishu_notifications_enabled').value = 'false'
@@ -255,3 +284,59 @@ class WorkflowNotificationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         with self.sessions() as db:
             self.assertTrue(db.get(NotificationLog, log.id).dispatch_ready)
+
+    def test_approval_card_failure_retries_with_the_same_uuid_and_preserves_audit_text(self):
+        from app.feishu import deliver_notification
+        item, _ = self.create()
+        log = self.logs('license', item['id'])[1]
+        with patch('app.feishu.SessionLocal', self.sessions), \
+                patch('app.feishu.redis_runtime.configured', return_value=False), \
+                patch('app.feishu.httpx.Client') as client:
+            sender = client.return_value.__enter__.return_value
+            sender.post.return_value.json.side_effect = [
+                {'code': 0, 'tenant_access_token': 'test-token'},
+                {'code': 230099, 'msg': 'must-not-leak-remote-error'},
+                {'code': 0, 'tenant_access_token': 'test-token'}, {'code': 0},
+            ]
+            deliver_notification(log.id)
+            first = sender.post.call_args.kwargs['json']
+            self.assertEqual(first['msg_type'], 'interactive')
+            self.assertEqual(json.loads(first['content'])['header']['title']['content'], '待审批 · License 授权')
+            with self.sessions() as db:
+                failed = db.get(NotificationLog, log.id)
+                self.assertEqual((failed.status, failed.attempt_count), ('failed', 1))
+                self.assertIn('卡片', failed.error)
+                self.assertIn('230099', failed.error)
+                self.assertNotIn('must-not-leak', failed.error)
+                self.assertIsNotNone(failed.next_attempt_at)
+                self.assertEqual(failed.message, log.message)
+            deliver_notification(log.id)
+            second = sender.post.call_args.kwargs['json']
+            self.assertEqual(first['uuid'], second['uuid'])
+            self.assertEqual(first['content'], second['content'])
+            self.assertEqual(sender.post.call_count, 4)
+            deliver_notification(log.id)
+            self.assertEqual(sender.post.call_count, 4)  # Sent cards are not duplicated.
+        with self.sessions() as db:
+            sent = db.get(NotificationLog, log.id)
+            self.assertEqual((sent.status, sent.attempt_count, sent.error), ('sent', 2, ''))
+
+    def test_real_pending_notifications_for_all_flows_send_cards_and_execution_wording(self):
+        from app.feishu import deliver_notification
+        for kind in ['resource', 'change', 'delivery', 'license']:
+            with self.subTest(kind=kind):
+                item, _ = self.create(kind)
+                self.assertEqual(self.action(kind, item['id'], 'first').status_code, 200)
+                log = self.logs(kind, item['id'])[-1]
+                with patch('app.feishu.SessionLocal', self.sessions), \
+                        patch('app.feishu.redis_runtime.configured', return_value=False), \
+                        patch('app.feishu.httpx.Client') as client:
+                    sender = client.return_value.__enter__.return_value
+                    sender.post.return_value.json.return_value = {'code': 0, 'tenant_access_token': 'test-token'}
+                    deliver_notification(log.id)
+                    payload = sender.post.call_args.kwargs['json']
+                    self.assertEqual(payload['msg_type'], 'interactive')
+                    content = json.loads(payload['content'])
+                    self.assertIn('待审批' if kind == 'license' else '待执行', content['header']['title']['content'])
+                with self.sessions() as db:
+                    self.assertEqual(db.get(NotificationLog, log.id).status, 'sent')

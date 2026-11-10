@@ -5,20 +5,38 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import User, WikiArticle, WikiArticleVersion, WikiSpace, WikiSpaceMember, now
+from .models import (Department, DepartmentMembership, User, WikiArticle, WikiArticleVersion,
+                     WikiSpace, WikiSpaceDepartment, WikiSpaceMember, now)
 
 DENIED = '内容不存在或无权访问'
 
 
+def range_access(user_id):
+    """Read grants from current organization rows; never copy department members."""
+    direct = select(Department.id).where(Department.active.is_(True), or_(
+        Department.id.in_(select(User.department_id).where(User.id == user_id).correlate(None)),
+        Department.id.in_(select(DepartmentMembership.department_id).where(DepartmentMembership.user_id == user_id).correlate(None)))).correlate(None)
+    ancestry = select(Department.id, Department.parent_id).where(Department.id.in_(direct)).cte(recursive=True)
+    # UNION 去重同时阻断历史循环部门；停用的部门不继续向上继承授权。
+    ancestry = ancestry.union(select(Department.id, Department.parent_id).join(
+        ancestry, Department.id == ancestry.c.parent_id).where(Department.active.is_(True)))
+    department_grant = exists(select(1).where(WikiSpaceDepartment.space_id == WikiSpace.id,
+        or_(WikiSpaceDepartment.department_id.in_(direct), and_(WikiSpace.include_subdepartments.is_(True),
+            WikiSpaceDepartment.department_id.in_(select(ancestry.c.id))))))
+    return or_(WikiSpace.access_scope == 'all', and_(WikiSpace.access_scope == 'departments', department_grant))
+
+
 def accessible_spaces(user_id):
-    return and_(WikiSpace.deleted_at.is_(None), or_(
+    return and_(exists(select(1).where(User.id == user_id, User.active.is_(True))).correlate(None),
+        WikiSpace.deleted_at.is_(None), or_(
         and_(WikiSpace.kind == 'personal', WikiSpace.owner_id == user_id),
         and_(WikiSpace.kind == 'shared', or_(WikiSpace.owner_id == user_id,
+            range_access(user_id),
             exists(select(1).where(WikiSpaceMember.space_id == WikiSpace.id, WikiSpaceMember.user_id == user_id))))
     ))
 
@@ -43,7 +61,7 @@ def ensure_personal_space(db, user):
 
 def get_space(db, space_id, user, *, manage=False, write=False, lock=False):
     query = select(WikiSpace).where(WikiSpace.id == space_id, accessible_spaces(user.id))
-    if lock: query = query.with_for_update()
+    if lock: query = query.with_for_update().execution_options(populate_existing=True)
     space = db.scalar(query)
     if not space: raise HTTPException(404, DENIED)
     if lock: db.info['wiki_locked'] = space.id
@@ -60,7 +78,8 @@ def space_role(db, space, user):
     query = select(WikiSpaceMember).where(WikiSpaceMember.space_id == space.id, WikiSpaceMember.user_id == user.id)
     if db.info.get('wiki_locked') == space.id: query = query.with_for_update().execution_options(populate_existing=True)
     member = db.scalar(query)
-    return member.role if member else None
+    if member: return member.role
+    return 'viewer' if db.scalar(select(WikiSpace.id).where(WikiSpace.id == space.id, accessible_spaces(user.id))) else None
 
 
 def serialized(item):
@@ -75,7 +94,15 @@ def serialized(item):
 def space_output(db, space, user):
     role = space_role(db, space, user)
     owner = db.get(User, space.owner_id)
+    departments = db.execute(select(Department.id, Department.name, Department.active).join(WikiSpaceDepartment,
+        WikiSpaceDepartment.department_id == Department.id).where(WikiSpaceDepartment.space_id == space.id).order_by(Department.id)).all()
+    members = db.execute(select(User.id, User.display_name, User.username, User.active, WikiSpaceMember.role)
+        .join(WikiSpaceMember, WikiSpaceMember.user_id == User.id).where(WikiSpaceMember.space_id == space.id)
+        .order_by(User.id)).all() if role == 'owner' else []
     return {**serialized(space), 'owner_name': owner.display_name if owner else '未指定',
+        'department_ids': [row.id for row in departments],
+        'access_departments': [dict(row._mapping) for row in departments],
+        **({'access_members': [dict(row._mapping) for row in members]} if role == 'owner' else {}),
         'my_role': role, 'can_manage': role == 'owner', 'can_write': role in {'owner', 'editor'},
         'article_count': db.scalar(select(func.count()).select_from(WikiArticle).where(
             WikiArticle.space_id == space.id, WikiArticle.status != 'archived')) or 0}
@@ -105,6 +132,16 @@ class SpaceIn(BaseModel):
     category: str = Field(default='', max_length=60)
     kind: Literal['personal', 'shared'] | None = None
     owner_id: int | None = Field(default=None, gt=0)
+    access_scope: Literal['members', 'departments', 'all'] | None = None
+    include_subdepartments: bool | None = None
+    department_ids: list[int] | None = Field(default=None, max_length=500)
+    member_ids: list[int] | None = Field(default=None, max_length=2000)
+
+    @field_validator('department_ids', 'member_ids')
+    @classmethod
+    def positive_ids(cls, values):
+        if values is not None and any(value <= 0 for value in values): raise ValueError('请选择有效对象')
+        return sorted(set(values)) if values is not None else None
 
     @field_validator('key')
     @classmethod
@@ -156,8 +193,53 @@ def validate_parent(db, space, parent_id, item_id=None):
         parent_id = parent.parent_id
 
 
+def save_access(db, space, data, actor):
+    """Validate the whole selection before changing any authorization rows."""
+    scope = data.access_scope or space.access_scope
+    department_ids = data.department_ids
+    member_ids = data.member_ids
+    if space.kind == 'personal':
+        if scope != 'members' or department_ids or member_ids:
+            raise HTTPException(400, '个人知识库仅自己可见，不能设置开放范围')
+        return
+    old_departments = set(db.scalars(select(WikiSpaceDepartment.department_id).where(WikiSpaceDepartment.space_id == space.id)))
+    selected_departments = set(department_ids) if department_ids is not None else old_departments
+    if scope == 'departments' and not selected_departments:
+        raise HTTPException(400, '请至少选择一个开放部门')
+    valid_departments = {d.id: d for d in db.scalars(select(Department).where(Department.id.in_(selected_departments)))}
+    if any(key not in valid_departments or (not valid_departments[key].active and key not in old_departments)
+           for key in selected_departments):
+        raise HTTPException(400, '请选择存在且已启用的部门')
+    old_members = {m.user_id: m for m in db.scalars(select(WikiSpaceMember).where(WikiSpaceMember.space_id == space.id))}
+    selected_members = set(member_ids) - {space.owner_id} if member_ids is not None else set(old_members)
+    people = {p.id: p for p in db.scalars(select(User).where(User.id.in_(selected_members)))}
+    if any(key not in people or (not people[key].active and key not in old_members) for key in selected_members):
+        raise HTTPException(400, '请选择存在且已启用的人员')
+    space.access_scope = scope
+    if data.include_subdepartments is not None: space.include_subdepartments = data.include_subdepartments
+    for key in old_departments - selected_departments:
+        db.execute(delete(WikiSpaceDepartment).where(WikiSpaceDepartment.space_id == space.id, WikiSpaceDepartment.department_id == key))
+    for key in selected_departments - old_departments:
+        db.add(WikiSpaceDepartment(space_id=space.id, department_id=key))
+    for key in set(old_members) - selected_members: db.delete(old_members[key])
+    for key in selected_members - set(old_members):
+        db.add(WikiSpaceMember(space_id=space.id, user_id=key, role='viewer', added_by=actor.id))
+    db.flush()
+
+
 def register_routes(app, current_user):
     from . import audit
+
+    @app.get('/api/wiki/access-options')
+    def access_options(q: str = Query('', max_length=100), db: Session = Depends(get_db), user=Depends(current_user)):
+        people = select(User).where(User.active.is_(True), User.id != user.id)
+        if q.strip(): people = people.where(or_(*(field.contains(q.strip(), autoescape=True)
+            for field in (User.display_name, User.username, User.department))))
+        departments = db.scalars(select(Department).where(Department.active.is_(True)).order_by(Department.sort_order, Department.id)).all()
+        from .organization import department_path
+        return {'departments': [{'id': d.id, 'name': d.name, 'parent_id': d.parent_id, 'path': department_path(db, d)} for d in departments],
+                'people': [{'id': p.id, 'display_name': p.display_name, 'username': p.username, 'active': p.active, 'department': p.department}
+                           for p in db.scalars(people.order_by(User.display_name, User.id).limit(50))]}
 
     @app.get('/api/wiki/spaces')
     def spaces(db: Session = Depends(get_db), user=Depends(current_user)):
@@ -176,6 +258,7 @@ def register_routes(app, current_user):
         try: db.flush()
         except IntegrityError:
             db.rollback(); raise HTTPException(409, '空间标识已存在')
+        save_access(db, space, data, user)
         audit.record(db, user, 'create', 'wiki_space', space)
         db.commit()
         return space_output(db, space, user)
@@ -211,8 +294,9 @@ def register_routes(app, current_user):
         space = get_space(db, space_id, user, manage=True, lock=True)
         if data.key != space.key: raise HTTPException(400, '空间标识创建后不可修改')
         if data.kind is not None and data.kind != space.kind:
-            raise HTTPException(400, '已有知识库的访问范围不可更改，请新建知识库以避免意外公开内容')
+            raise HTTPException(400, '个人知识库与共享知识库不能互相转换，请修改共享空间的开放范围')
         before = audit.snapshot(db, 'wiki_space', space)
+        save_access(db, space, data, user)
         owner_id = data.owner_id or space.owner_id
         if owner_id != space.owner_id:
             if space.kind == 'personal': raise HTTPException(400, '个人知识库不能转让或添加成员')
@@ -288,7 +372,9 @@ def register_routes(app, current_user):
         member = db.get(WikiSpaceMember, (space.id, user_id))
         if not member: raise HTTPException(404, '空间成员不存在')
         log_member(db, user, space, db.get(User, user_id), member.role, None)
-        db.delete(member); db.commit(); return {'ok': True}
+        db.delete(member); db.flush()
+        remaining = space_role(db, space, db.get(User, user_id))
+        db.commit(); return {'ok': True, 'still_has_access': bool(remaining)}
 
     @app.get('/api/wiki')
     def articles(space_id: int | None = None, parent_id: int | None = None, scope: Literal['personal', 'shared'] | None = None,

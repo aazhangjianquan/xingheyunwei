@@ -2,6 +2,7 @@
 import { computed, ref, onMounted } from 'vue'
 import { Search, X } from 'lucide-vue-next'
 import { get, post, put } from './api'
+import MemberPicker from './MemberPicker.vue'
 const props=defineProps({user:Object})
 const emit=defineEmits(['notice'])
 const projects=ref([]), people=ref([]), roles=ref([]), editing=ref(null), busy=ref(false)
@@ -26,26 +27,29 @@ const filteredProjects=computed(()=>{
 function resetFilters(){search.value='';departmentFilter.value='';statusFilter.value='all'}
 const isAdmin=()=>props.user.roles.includes('admin')
 const roleAlias={leader:'manager',project_owner:'project_manager',project_director:'project_manager_head',sales_head:'commercial_head',sales_director:'commercial_head',development_head:'technical_head'}
-const effectiveRoles=(person)=>person.canonical_roles || (person.roles||[]).map(r=>roleAlias[r]||r)
 const canEditRole=(role)=>isAdmin() || Boolean(editing.value?.manageable_roles?.includes(role))
 async function act(fn){busy.value=true;try{await fn()}catch(e){emit('notice',e.message)}finally{busy.value=false}}
 async function load(){
   loadError.value=''
-  try {[projects.value,roles.value]=await Promise.all([get('/projects'),get('/roles')]);loaded.value=true}
+  try {[projects.value,roles.value]=await Promise.all([get('/projects'),get('/project-positions')]);loaded.value=true}
   catch(e){loadError.value='项目加载失败：'+e.message;throw e}
 }
 async function edit(p){await act(async()=>{
   // The member directory is only needed when editing, never on a page refresh.
-  people.value=await get('/users')
-  editing.value=p?JSON.parse(JSON.stringify(p)):{name:'',department:'',active:true,members:[]}
+  people.value=await get('/project-candidates')
+  editing.value=p?JSON.parse(JSON.stringify(p)):{name:'',department_id:null,active:true,members:[]}
 })}
-function candidates(role){return people.value.filter(p=>p.active&&effectiveRoles(p).includes(role)&& (isAdmin() || !roles.value.some(r=>effectiveRoles(props.user).includes(r.id)&&r.managed_roles?.includes(role)) || p.department===props.user.department))}
-async function save(){await act(async()=>{const p=editing.value; if(!p.id) await post('/projects',p); else if(isAdmin()) await put(`/projects/${p.id}`,p); else await put(`/projects/${p.id}/members`,{members:p.members}); editing.value=null;await load();emit('notice','项目及岗位成员已保存')})}
+function candidates(role){
+  const existing=(editing.value?.members || []).filter(m=>m.role===role && !people.value.some(p=>p.id===m.user_id)).map(m=>({id:m.user_id,display_name:m.name || `成员 #${m.user_id}`,active:false}))
+  return [...people.value.filter(p=>p.active),...existing]
+}
+function selectMembers(role,ids){editing.value.members=[...editing.value.members.filter(m=>(roleAlias[m.role]||m.role)!==role),...ids.map(user_id=>({user_id,role}))]}
+async function save(){await act(async()=>{const p=editing.value; const body={name:p.name,active:p.active,members:p.members.map(m=>({user_id:m.user_id,role:m.role}))}; if(!p.id) await post('/projects',body); else if(isAdmin()) await put(`/projects/${p.id}`,body); else await put(`/projects/${p.id}/members`,{members:p.members}); editing.value=null;await load();emit('notice','项目及岗位成员已保存')})}
 onMounted(()=>act(load))
 </script>
 <template>
   <section class="panel settings-card project-management">
-    <div class="flow-toolbar project-heading"><div><h3>项目与岗位成员</h3><p class="field-help">先授予成员角色，再分配项目岗位。项目经理维护项目成员；本部门负责人仅维护各自负责的岗位。</p></div><button v-if="isAdmin()" class="primary-button" :disabled="busy" @click="edit()">＋ 创建项目</button></div>
+    <div class="flow-toolbar project-heading"><div><h3>项目与岗位成员</h3><p class="field-help">从平台已有成员中指定项目岗位；项目经理维护本项目成员，项目经理由系统管理员指定。</p></div><button v-if="isAdmin()" class="primary-button" :disabled="busy" @click="edit()">＋ 创建项目</button></div>
     <div class="project-stats" aria-label="项目统计" :aria-busy="!loaded || Boolean(loadError)">
       <div class="project-stat total"><span>项目总数</span><strong>{{loaded && !loadError ? projectCounts.total : '—'}}</strong><small>{{isAdmin()?'全部项目':'我可查看的项目'}}</small></div>
       <div class="project-stat"><span><i class="active-dot"></i>启用项目</span><strong>{{loaded && !loadError ? projectCounts.active : '—'}}</strong><small>可用于提交业务申请</small></div>
@@ -66,9 +70,8 @@ onMounted(()=>act(load))
       <p v-else-if="!busy" class="empty-mini">{{isAdmin()?'暂无项目，点击「创建项目」开始添加。':'暂无参与的项目，请联系管理员创建并分配岗位。'}}</p>
     </template>
   </section>
-  <div v-if="editing" class="modal-backdrop" @click.self="editing=null"><form class="modal-panel" @submit.prevent="save"><div class="modal-head"><h3>{{editing.id?'维护项目':'创建项目'}}</h3><button type="button" class="text-button" @click="editing=null">关闭</button></div><div class="modal-body"><div class="form-grid"><label class="field"><span>项目名称</span><input v-model="editing.name" required :disabled="!isAdmin()" /></label><label class="field"><span>所属部门</span><input v-model="editing.department" required :disabled="!isAdmin()" /></label><label v-if="isAdmin()" class="field"><span>项目状态</span><select v-model="editing.active"><option :value="true">启用</option><option :value="false">停用</option></select></label></div>
-    <div v-for="m in editing.members.filter(m=>!people.some(p=>p.id===m.user_id && p.active && effectiveRoles(p).includes(roleAlias[m.role]||m.role)))" :key="m.user_id+'-'+m.role" class="settings-note"><span>岗位失效：{{people.find(p=>p.id===m.user_id)?.display_name || m.user_id}} / {{roles.find(r=>r.id===(roleAlias[m.role]||m.role))?.name || m.role}}</span><button type="button" class="text-button danger" :disabled="!canEditRole(roleAlias[m.role]||m.role)" @click="editing.members=editing.members.filter(x=>x!==m)">移除失效岗位</button></div>
-    <div v-for="r in roles.filter(r=>r.project_member_role)" :key="r.id" class="project-role-select"><label class="field"><span>{{r.name}} {{r.id==='project_manager'?'（项目必须至少一名）':''}}</span></label><div class="role-options"><label v-for="p in candidates(r.id)" :key="p.id"><input type="checkbox" :checked="editing.members.some(m=>m.user_id===p.id&&((roleAlias[m.role]||m.role)===r.id))" :disabled="!canEditRole(r.id)" @change="$event.target.checked?editing.members.push({user_id:p.id,role:r.id}):editing.members=editing.members.filter(m=>!(m.user_id===p.id&&((roleAlias[m.role]||m.role)===r.id)))" />{{p.display_name}}</label><small v-if="!candidates(r.id).length" class="muted">暂无获授此角色的成员</small></div></div>
+  <div v-if="editing" class="modal-backdrop" @click.self="editing=null"><form class="modal-panel" @submit.prevent="save"><div class="modal-head"><h3>{{editing.id?'维护项目':'创建项目'}}</h3><button type="button" class="text-button" @click="editing=null">关闭</button></div><div class="modal-body"><div class="form-grid"><label class="field"><span>项目名称</span><input v-model="editing.name" required :disabled="!isAdmin()" /></label><label v-if="isAdmin()" class="field"><span>项目状态</span><select v-model="editing.active"><option :value="true">启用</option><option :value="false">停用</option></select></label></div>
+    <div v-for="r in roles" :key="r.id" class="project-role-select"><div class="field"><span>{{r.name}} {{r.id==='project_manager'?'（项目必须至少一名）':''}}</span><MemberPicker :model-value="editing.members.filter(m=>(roleAlias[m.role]||m.role)===r.id).map(m=>m.user_id)" :options="candidates(r.id)" :label="r.name" :disabled="busy || !canEditRole(r.id)" @update:model-value="ids=>selectMembers(r.id,ids)" /></div></div>
     <div class="form-footer"><button class="primary-button" :disabled="busy">保存项目</button></div></div></form></div>
 </template>
 <style scoped>

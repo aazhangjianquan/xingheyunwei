@@ -74,7 +74,7 @@ def register_routes(app, current_user, require_role):
                     raise ValueError("invalid credentials")
         except (httpx.HTTPError, ValueError):
             raise HTTPException(502, "飞书连接失败，请核对 App ID、App Secret 与网络")
-        return {"message": "应用鉴权成功。请确认机器人已启用、应用已发布，并开通消息发送权限；无需配置登录回调地址。"}
+        return {"message": "应用鉴权成功。请确认机器人已启用、应用已发布，并开通消息发送权限。启用任务免密还需配置网页应用和授权回调地址，并在飞书客户端完成登录联调。"}
 
     @app.get("/api/admin/workflows")
     def routes(db: Session = Depends(get_db), user=Depends(admin)):
@@ -93,14 +93,17 @@ def register_routes(app, current_user, require_role):
 
     @app.post("/api/admin/notifications/{item_id}/retry")
     def retry_notification(item_id: int, tasks: BackgroundTasks, db: Session = Depends(get_db), user=Depends(admin)):
-        from . import reminders
+        from . import reminders, personal_reminders
+        personal_context = personal_reminders.lock_notification_context(db, item_id)
+        if personal_context and (not personal_context[0] or personal_context[0].owner_id != user.id):
+            raise HTTPException(404, '通知不存在或无权管理')
         context = reminders.lock_notification_context(db, item_id)
         item = db.scalar(select(NotificationLog).where(NotificationLog.id == item_id).with_for_update())
         if not item or item.status == "sent":
             raise HTTPException(400, "通知不存在或已经发送")
         if item.status == 'pending' and item.dispatch_ready:
             raise HTTPException(400, '通知已在队列中，请等待处理')
-        invalid = reminders.invalid_reason(db, context)
+        invalid = personal_reminders.invalid_reason(db, personal_context) or reminders.invalid_reason(db, context)
         if invalid:
             raise HTTPException(409, invalid[1])
         item.status = "pending"

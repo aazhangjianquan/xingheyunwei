@@ -146,6 +146,6 @@ test('legacy review uses the applicants project options and submits the explicit
     assert.equal(h.calls.some(c=>c.method==='POST'),false)
     h.state.legacyProjectId.value=8
     await h.state.submitReview()
-    assert.deepEqual(h.calls.find(c=>c.method==='POST'),{method:'POST',path:'/licenses/9/submit-review',body:{project_id:8}})
+    assert.deepEqual(h.calls.find(c=>c.method==='POST'),{method:'POST',path:'/licenses/9/submit-review',body:{project_id:8,application_department_id:null}})
   } finally {h.cleanup()}
 })

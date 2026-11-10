@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
@@ -32,18 +32,24 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(80))
     department: Mapped[str] = mapped_column(String(100), default="")
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(30), index=True)  # primary grant; see roles.py
     password_hash: Mapped[str] = mapped_column(String(255))
     feishu_open_id: Mapped[str | None] = mapped_column(EncryptedOpenId(), nullable=True, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     role_grants: Mapped[list["UserRole"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    organization_department: Mapped["Department | None"] = relationship(foreign_keys=[department_id], lazy="joined")
+    department_memberships: Mapped[list["DepartmentMembership"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    position_grants: Mapped[list["DepartmentUserPosition"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    organization_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
 class ResourceRequest(Base):
     __tablename__ = "resource_requests"
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    application_department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(40), unique=True)
     project_name: Mapped[str] = mapped_column(String(150), index=True)
     applicant_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -52,7 +58,7 @@ class ResourceRequest(Base):
     specification: Mapped[str] = mapped_column(Text)
     # JSON object of values captured against the resource type catalog.  The
     # rendered specification above remains the audit/history friendly summary.
-    specification_values: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    specification_values: Mapped[str] = mapped_column(Text, default="{}", server_default=text("('{}')"))
     start_date: Mapped[str] = mapped_column(String(30))
     end_date: Mapped[str] = mapped_column(String(30))
     purpose: Mapped[str] = mapped_column(Text)
@@ -76,6 +82,7 @@ class ChangeRequest(Base):
     environment: Mapped[str] = mapped_column(String(30), default="生产")
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    application_department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(40), unique=True)
     name: Mapped[str] = mapped_column(String(180))
     change_type: Mapped[str] = mapped_column(String(50))
@@ -98,6 +105,7 @@ class DeliveryProject(Base):
     __tablename__ = "delivery_projects"
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    application_department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(40), unique=True)
     name: Mapped[str] = mapped_column(String(180))
     customer: Mapped[str] = mapped_column(String(180))
@@ -170,6 +178,7 @@ class LicenseRequest(Base):
     code: Mapped[str] = mapped_column(String(40), unique=True)
     applicant_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    application_department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     project_name: Mapped[str] = mapped_column(String(150))
     customer: Mapped[str] = mapped_column(String(180))
     product: Mapped[str] = mapped_column(String(150))
@@ -238,8 +247,16 @@ class WikiSpace(Base):
     category: Mapped[str] = mapped_column(String(60), default='', server_default='')
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     personal_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True, unique=True)
+    access_scope: Mapped[str] = mapped_column(String(20), default='members', server_default='members')
+    include_subdepartments: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
     members_initialized: Mapped[bool] = mapped_column(Boolean, default=True, server_default='1')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class WikiSpaceDepartment(Base):
+    __tablename__ = 'wiki_space_departments'
+    space_id: Mapped[int] = mapped_column(ForeignKey('wiki_spaces.id', ondelete='CASCADE'), primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey('departments.id'), primary_key=True, index=True)
 
 
 class WikiSpaceMember(Base):
@@ -347,6 +364,43 @@ class ResourceReminderContact(Base):
     __table_args__ = (UniqueConstraint('resource_id', 'instance_id', 'user_id', name='uq_resource_reminder_contact'),)
 
 
+class PersonalReminder(Base):
+    __tablename__ = 'personal_reminders'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    content: Mapped[str] = mapped_column(Text)
+    remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(String(20), default='draft')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (Index('ix_personal_reminders_owner', 'owner_id', 'deleted_at', 'id'),
+                      Index('ix_personal_reminders_due', 'state', 'remind_at', 'id'))
+
+
+class PersonalReminderRecipient(Base):
+    __tablename__ = 'personal_reminder_recipients'
+    reminder_id: Mapped[int] = mapped_column(ForeignKey('personal_reminders.id'), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), primary_key=True)
+    notification_id: Mapped[int | None] = mapped_column(ForeignKey('notification_logs.id'), nullable=True, unique=True)
+
+
+class PersonalReminderAttachment(Base):
+    __tablename__ = 'personal_reminder_attachments'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey('personal_reminders.id'), index=True)
+    uploaded_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    filename: Mapped[str] = mapped_column(String(255))
+    storage_key: Mapped[str] = mapped_column(String(64), unique=True)
+    storage_backend: Mapped[str] = mapped_column(String(16), default='local', server_default='local')
+    storage_bucket: Mapped[str] = mapped_column(String(63), default='', server_default='')
+    extension: Mapped[str] = mapped_column(String(10))
+    content_type: Mapped[str] = mapped_column(String(100))
+    size: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class RequestRateLimit(Base):
     __tablename__ = "request_rate_limits"
     subject: Mapped[str] = mapped_column(String(80), primary_key=True)
@@ -393,6 +447,66 @@ class LoginTicket(Base):
 
 
 
+class Department(Base):
+    __tablename__ = "departments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    description: Mapped[str] = mapped_column(String(500), default="")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    approval_mode: Mapped[str] = mapped_column(String(30), default="designated_managers")
+    managers: Mapped[list["DepartmentManager"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class DepartmentAlias(Base):
+    __tablename__ = "department_aliases"
+    name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), index=True)
+
+
+class DepartmentMembership(Base):
+    __tablename__ = "department_memberships"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), primary_key=True, index=True)
+    department: Mapped["Department"] = relationship(lazy="joined")
+
+
+class DepartmentManager(Base):
+    __tablename__ = "department_managers"
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+
+
+class DepartmentPosition(Base):
+    __tablename__ = "department_positions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    manager_assignable: Mapped[bool] = mapped_column(Boolean, default=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    department: Mapped["Department"] = relationship(lazy="joined")
+    role_grants: Mapped[list["DepartmentPositionRole"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    __table_args__ = (UniqueConstraint("department_id", "name", name="uq_department_position_name"),)
+
+
+class DepartmentPositionRole(Base):
+    __tablename__ = "department_position_roles"
+    position_id: Mapped[int] = mapped_column(ForeignKey("department_positions.id"), primary_key=True)
+    role: Mapped[str] = mapped_column(String(30), primary_key=True)
+
+
+class DepartmentUserPosition(Base):
+    __tablename__ = "department_user_positions"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("department_positions.id"), primary_key=True)
+    department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"), primary_key=True, index=True)
+    position: Mapped["DepartmentPosition"] = relationship(lazy="joined")
+    department: Mapped["Department"] = relationship(lazy="joined")
+
+
 class UserRole(Base):
     __tablename__ = "user_roles"
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
@@ -404,6 +518,7 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(150), unique=True)
     department: Mapped[str] = mapped_column(String(100))
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"), nullable=True, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -458,6 +573,7 @@ class WorkflowNode(Base):
     node_type: Mapped[str] = mapped_column(String(30))
     mode: Mapped[str] = mapped_column(String(10))
     config: Mapped[str] = mapped_column(Text)
+    assignment_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="waiting")
     __table_args__ = (UniqueConstraint("instance_id", "position", name="uq_instance_position"),)
 

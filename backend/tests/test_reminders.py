@@ -138,6 +138,33 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual({l.event for l in logs}, {'license_15d'})
         self.assertTrue(all('当前剩余约' in l.message and '还剩 15 天' not in l.message for l in logs))
 
+    def test_license_delivery_refreshes_card_countdown_and_closed_reminders_send_nothing(self):
+        item_id = self.create(days=5)
+        stamp = now()
+        with patch('app.reminders.now', return_value=stamp):
+            run_once(self.sessions)
+        log = self.logs()[0]
+        later = stamp + timedelta(hours=2)
+        with patch('app.feishu.now', return_value=later), patch('app.reminders.now', return_value=later):
+            calls = self.deliver(log.id)
+        sent = json.loads(calls[-1].content)
+        self.assertEqual(sent['msg_type'], 'interactive')
+        content = json.loads(sent['content'])
+        self.assertEqual(content['header']['title']['content'], 'License 即将到期')
+        serialized = json.dumps(content, ensure_ascii=False)
+        with self.sessions() as db:
+            item = db.get(LicenseRequest, item_id)
+            expiry, _ = reminders.dates('license', item)
+            minutes = int((expiry - later).total_seconds() // 60)
+            self.assertIn(f'{minutes // 1440} 天 {minutes % 1440 // 60} 小时', serialized)
+            saved = db.get(NotificationLog, log.id)
+            self.assertEqual(saved.status, 'sent')
+            self.assertIn('当前剩余约', saved.message)
+            self.assertNotIn('must-never-send-this-key', serialized)
+            self.assertNotIn('must-never-send-this-key', saved.message)
+        self.assertEqual(self.toggle(item_id, False).status_code, 200)
+        self.assertEqual(self.deliver(self.logs()[1].id), [])
+
     def test_permissions_revision_audit_and_cancelled_worker(self):
         item_id = self.create()
         run_once(self.sessions)
@@ -253,7 +280,7 @@ class ReminderTests(unittest.TestCase):
         self.assertTrue(all(l.status == 'skipped' for l in self.logs()[:2]))
         self.assertEqual({l.event for l in self.logs()[2:]}, {'license_15d'})
 
-    def test_operator_role_revocation_blocks_delivery_but_owner_still_receives(self):
+    def test_old_operator_role_removal_keeps_explicit_execution_contact(self):
         self.create('resource', days=2)
         run_once(self.sessions)
         with self.sessions() as db:
@@ -262,9 +289,9 @@ class ReminderTests(unittest.TestCase):
             db.commit()
         for log in self.logs():
             calls = self.deliver(log.id)
-            self.assertEqual(len(calls), 2 if log.recipient_id == self.ids['owner'] else 0)
+            self.assertEqual(len(calls), 2)
         with self.sessions() as db:
-            self.assertEqual(db.scalar(select(NotificationLog.status).where(NotificationLog.recipient_id == self.ids['operator'])), 'unconfigured')
+            self.assertEqual(db.scalar(select(NotificationLog.status).where(NotificationLog.recipient_id == self.ids['operator'])), 'sent')
         self.assertEqual(run_once(self.sessions)['notifications'], 0)
 
     def test_list_filter_and_pending_execution_permissions(self):
@@ -285,6 +312,111 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(response.json()['total'], 1)
         self.assertEqual(self.client.get('/api/resources?reminder=enabled', headers=self.headers['owner']).json()['total'], 0)
         self.assertEqual(run_once(self.sessions)['notifications'], 0)
+
+    def test_next_milestone_is_stable_with_sent_and_unconfigured_recipients(self):
+        item_id = self.create(days=5)
+        run_once(self.sessions)
+        with self.sessions() as db:
+            db.get(User, self.ids['final']).feishu_open_id = None
+            for log in db.scalars(select(NotificationLog)):
+                log.status = 'sent' if log.recipient_id == self.ids['owner'] else 'cancelled'
+                log.error = '' if log.status == 'sent' else '单据到期提醒已关闭'
+            db.commit()
+            expiry, rules = reminders.dates('license', db.get(LicenseRequest, item_id))
+            expected = reminders.iso(dict(rules)['license_1d'])
+        stamp = now()
+        for read_at in (stamp, stamp + timedelta(minutes=10), stamp + timedelta(hours=1)):
+            with patch('app.reminders.now', return_value=read_at):
+                response = self.client.get(f'/api/licenses/{item_id}/reminder', headers=self.headers['owner'])
+            self.assertEqual(response.status_code, 200, response.text)
+            state = response.json()
+            self.assertEqual(state['next_at'], expected)
+            self.assertEqual(state['next_rule'], '到期前 1 天')
+            self.assertEqual(state['current_delivery']['rule'], '到期前 7 天')
+            recipients = {p['id']: p for p in state['current_delivery']['recipients']}
+            self.assertEqual(recipients[self.ids['owner']]['status'], 'sent')
+            self.assertEqual(recipients[self.ids['final']]['status'], 'unconfigured')
+            self.assertEqual(recipients[self.ids['final']]['error'], '未配置飞书')
+
+    def test_get_details_and_unchanged_patch_preserve_modification_and_delivery_state(self):
+        item_id = self.create(days=5)
+        run_once(self.sessions)
+        stamp = now()
+        with patch('app.reminders.now', return_value=stamp):
+            disabled = self.toggle(item_id, False)
+        self.assertEqual(disabled.status_code, 200)
+        with patch('app.reminders.now', return_value=stamp + timedelta(minutes=1)):
+            enabled = self.toggle(item_id, True, revision=2)
+        self.assertEqual(enabled.status_code, 200)
+        expected_updated = reminders.iso(stamp + timedelta(minutes=1))
+        with self.sessions() as db:
+            before_audit = db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.record_kind == 'business'))
+            item = db.get(LicenseRequest, item_id)
+            before_business_updated = item.updated_at
+            # A read/no-op save must not resume a cancelled delivery.
+            db.get(NotificationLog, self.logs()[0].id).status = 'cancelled'
+            db.commit()
+        for offset in (2, 3, 4):
+            with patch('app.reminders.now', return_value=stamp + timedelta(minutes=offset)):
+                for path in (f'/api/licenses/{item_id}', f'/api/licenses/{item_id}/reminder'):
+                    response = self.client.get(path, headers=self.headers['owner'])
+                    self.assertEqual(response.status_code, 200, response.text)
+                    state = response.json()['reminder'] if path.endswith(str(item_id)) else response.json()
+                    self.assertEqual((state['revision'], state['updated_at']), (3, expected_updated))
+                unchanged = self.toggle(item_id, True, revision=3)
+                self.assertEqual(unchanged.status_code, 200, unchanged.text)
+                self.assertEqual(unchanged.json()['updated_at'], expected_updated)
+        with self.sessions() as db:
+            item = db.get(LicenseRequest, item_id)
+            self.assertEqual(item.updated_at, before_business_updated)
+            self.assertEqual(item.reminder_revision, 3)
+            self.assertEqual(db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.record_kind == 'business')), before_audit)
+            self.assertEqual(db.get(NotificationLog, self.logs()[0].id).status, 'cancelled')
+
+    def test_due_retry_and_exhausted_failure_do_not_replace_next_business_node(self):
+        item_id = self.create(days=5)
+        run_once(self.sessions)
+        stamp = now()
+        retry_at = stamp + timedelta(seconds=30)
+        with self.sessions() as db:
+            logs = list(db.scalars(select(NotificationLog)))
+            logs[0].status, logs[0].next_attempt_at = 'failed', retry_at
+            logs[1].status, logs[1].attempt_count, logs[1].next_attempt_at = 'failed', 3, None
+            db.commit()
+            item = db.get(LicenseRequest, item_id)
+            with patch('app.reminders.now', return_value=stamp):
+                state = reminders.info(db, 'license', item)
+            self.assertEqual(state['next_at'], reminders.iso(dict(reminders.dates('license', item)[1])['license_1d']))
+            recipients = {p['id']: p for p in state['current_delivery']['recipients']}
+            self.assertEqual(recipients[self.ids['owner']]['next_attempt_at'], reminders.iso(retry_at))
+            self.assertEqual(recipients[self.ids['final']]['status'], 'failed')
+            self.assertIsNone(recipients[self.ids['final']]['next_attempt_at'])
+
+    def test_last_node_incomplete_does_not_claim_all_reminders_processed(self):
+        item_id = self.create(days=0.5)
+        run_once(self.sessions)
+        with self.sessions() as db:
+            item = db.get(LicenseRequest, item_id)
+            state = reminders.info(db, 'license', item)
+            self.assertIsNone(state['next_at'])
+            self.assertIsNone(state['next_rule'])
+            self.assertEqual(state['current_delivery']['rule'], '到期前 1 天')
+            self.assertTrue(all(p['status'] == 'pending' for p in state['current_delivery']['recipients']))
+
+    def test_future_calendar_node_before_first_delivery_and_resource_after_only_node(self):
+        license_id = self.create(days=70)
+        resource_id = self.create('resource', days=2)
+        with self.sessions() as db:
+            item = db.get(LicenseRequest, license_id)
+            expected = reminders.iso(dict(reminders.dates('license', item)[1])['license_1m'])
+            state = reminders.info(db, 'license', item)
+            self.assertEqual(state['next_at'], expected)
+            self.assertIsNone(state['current_delivery'])
+            resource = db.get(ResourceRequest, resource_id)
+            state = reminders.info(db, 'resource', resource)
+            self.assertIsNone(state['next_at'])
+            self.assertEqual(state['current_delivery']['rule'], '结束前 7 天')
+            self.assertTrue(all(p['status'] == 'awaiting_scan' for p in state['current_delivery']['recipients']))
 
 
 if __name__ == '__main__':

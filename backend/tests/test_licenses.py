@@ -10,13 +10,13 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, delete
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.main import app
 from app.license_tool import generate_key
-from app.models import AuditLog, LicenseRequest, User, UserRole, WorkflowInstance, Project, ProjectMember
+from app.models import AuditLog, LicenseRequest, User, UserRole, WorkflowInstance, Project, ProjectMember, Department, DepartmentManager
 from app.security import decrypt_secret, encrypt_secret, make_token
 
 from app.rate_limit import RateDecision
@@ -52,6 +52,11 @@ class LicenseTests(unittest.TestCase):
             self.project_id, self.other_project_id = project.id, other_project.id
             for name, pid in [('owner',project.id),('other',other_project.id),('final',project.id)]:
                 db.add(ProjectMember(project_id=pid,user_id=self.ids[name],role='applicant'))
+            from app import organization as org
+            org.seed_organization(db)
+            self.dept_id = project.department_id
+            db.add(DepartmentManager(department_id=self.dept_id, user_id=self.ids['reviewer']))
+            db.commit()
             from app.licenses import seed_license_workflow
             seed_license_workflow(db)
         self.headers = {name: {'Authorization': 'Bearer ' + make_token(uid)} for name, uid in self.ids.items()}
@@ -112,7 +117,7 @@ class LicenseTests(unittest.TestCase):
         definition['steps'][0]['assignee']={'source':'department_role','role':'department_head'}
         return definition
 
-    def test_admin_can_apply_without_membership_using_project_department_and_read_own_key(self):
+    def test_admin_can_apply_without_project_membership_using_own_department_and_read_key(self):
         with self.sessions() as db:
             db.get(User,self.ids['admin']).department='平台管理'
             db.get(Project,self.other_project_id).active=False
@@ -125,7 +130,7 @@ class LicenseTests(unittest.TestCase):
         item_id=self.create('admin')
         data=self.read(item_id,'admin')
         self.assertEqual((data['applicant_id'],data['owner_department']),(self.ids['admin'],'平台管理'))
-        self.assertEqual((data['approval_department'],data['approval_department_source']),('同一部门','project'))
+        self.assertEqual((data['approval_department'],data['approval_department_source']),('同一部门','selected_membership'))
         self.assertEqual(self.task(item_id)['assignee_id'],self.ids['reviewer'])
         self.assertEqual(self.act(item_id,'admin').status_code,403)
         # Project changes after submission must not rewrite the frozen route.
@@ -175,6 +180,11 @@ class LicenseTests(unittest.TestCase):
             replacement=db.get(User,self.ids['replacement'])
             replacement.department='申请人部门'
             replacement.role_grants.append(UserRole(role='department_head'))
+            department=Department(name='申请人部门');db.add(department);db.flush()
+            department_id=department.id
+            db.get(User,self.ids['owner']).department_id=department.id
+            replacement.department_id=department.id
+            db.add(DepartmentManager(department_id=department.id,user_id=replacement.id))
             data={k:v for k,v in self.body.items() if k!='project_id'}
             items={}
             for who in ['admin','owner']:
@@ -184,12 +194,12 @@ class LicenseTests(unittest.TestCase):
             from app.licenses import seed_license_workflow
             seed_license_workflow(db)
         self.publish(self.department_definition())
-        for who,department,source,reviewer in [('admin','同一部门','project','reviewer'),('owner','申请人部门','applicant','replacement')]:
+        for who,department,source,reviewer in [('admin','同一部门','selected_membership','reviewer'),('owner','申请人部门','selected_membership','replacement')]:
             with self.subTest(applicant=who):
                 options=self.client.get(f'/api/licenses/{items[who]}/projects',headers=self.headers['admin'])
                 self.assertEqual(options.status_code,200,options.text)
                 self.assertIn(self.project_id,[p['id'] for p in options.json()])
-                response=self.client.post(f'/api/licenses/{items[who]}/submit-review',headers=self.headers['admin'],json={'project_id':self.project_id})
+                response=self.client.post(f'/api/licenses/{items[who]}/submit-review',headers=self.headers['admin'],json={'project_id':self.project_id,'application_department_id': self.dept_id if who=='admin' else department_id})
                 self.assertEqual(response.status_code,200,response.text)
                 self.assertEqual(response.json()['applicant_id'],self.ids[who])
                 self.assertEqual((response.json()['approval_department'],response.json()['approval_department_source']),(department,source))
@@ -202,32 +212,27 @@ class LicenseTests(unittest.TestCase):
         self.publish(self.department_definition())
         item_id=self.create()
         data=self.read(item_id)
-        self.assertEqual((data['approval_department'],data['approval_department_source']),('同一部门','applicant'))
+        self.assertEqual((data['approval_department'],data['approval_department_source']),('同一部门','selected_membership'))
         self.assertEqual(self.task(item_id)['assignee_id'],self.ids['reviewer'])
         denied=self.client.post('/api/licenses',json={**self.body,'project_id':self.other_project_id},headers=self.headers['owner'])
         self.assertEqual(denied.status_code,403,denied.text)
 
-    def test_admin_missing_qualified_project_department_reviewer_is_explicit_and_atomic(self):
+    def test_admin_missing_independent_department_reviewer_is_explicit_and_atomic(self):
         self.publish(self.department_definition())
-        for scenario in ['missing_department','no_reviewer','disabled_reviewer','revoked_role','applicant_only']:
+        for scenario in ['no_reviewer','disabled_reviewer','revoked_appointment','applicant_only']:
             with self.subTest(scenario=scenario):
                 with self.sessions() as db:
-                    admin=db.get(User,self.ids['admin']);admin.department='平台管理';admin.role_grants=[UserRole(role='admin')]
-                    reviewer=db.get(User,self.ids['reviewer']);reviewer.active=True;reviewer.role_grants=[UserRole(role='department_head')]
-                    project=db.get(Project,self.project_id);project.department='同一部门'
-                    db.flush()
-                    if scenario=='missing_department': project.department=''
-                    elif scenario=='no_reviewer': project.department='未配置负责人部门'
-                    elif scenario=='disabled_reviewer': reviewer.active=False
-                    elif scenario=='revoked_role': reviewer.role_grants=[UserRole(role='applicant')]
-                    else:
-                        project.department=admin.department
-                        admin.role_grants.append(UserRole(role='department_head'))
+                    reviewer=db.get(User,self.ids['reviewer']);reviewer.active=True
+                    db.execute(delete(DepartmentManager))
+                    if scenario=='disabled_reviewer':
+                        reviewer.active=False
+                        db.add(DepartmentManager(department_id=self.dept_id,user_id=reviewer.id))
+                    elif scenario=='applicant_only':
+                        db.add(DepartmentManager(department_id=self.dept_id,user_id=self.ids['admin']))
                     db.commit()
                 response=self.client.post('/api/licenses',json=self.body,headers=self.headers['admin'])
                 self.assertEqual(response.status_code,409,response.text)
-                self.assertIn('部门审核',response.json()['detail'])
-                self.assertIn('项目所属部门' if scenario=='missing_department' else f'项目「{self.body["project_name"]}」所属部门',response.json()['detail'])
+                self.assertIn('独立审批人',response.json()['detail'])
                 with self.sessions() as db:
                     self.assertIsNone(db.scalar(select(LicenseRequest)))
                     self.assertIsNone(db.scalar(select(WorkflowInstance)))
@@ -250,8 +255,15 @@ class LicenseTests(unittest.TestCase):
             db.get(Project,self.project_id).department='新项目部门'
             person=db.get(User,self.ids['replacement']);person.department='新项目部门'
             person.role_grants.append(UserRole(role='department_head'))
+            department=Department(name='新项目部门');db.add(department);db.flush()
+            db.get(Project,self.project_id).department_id=department.id
+            from app.models import DepartmentMembership
+            db.add(DepartmentMembership(user_id=self.ids['admin'],department_id=department.id))
+            next_department_id=department.id
+            person.department_id=department.id
+            db.add(DepartmentManager(department_id=department.id,user_id=person.id))
             db.commit()
-        response=self.client.post(f'/api/licenses/{item_id}/resubmit',json=self.body,headers=self.headers['admin'])
+        response=self.client.post(f'/api/licenses/{item_id}/resubmit',json={**self.body,'application_department_id':next_department_id},headers=self.headers['admin'])
         self.assertEqual(response.status_code,200,response.text)
         self.assertEqual(response.json()['approval_department'],'新项目部门')
         self.assertEqual(len(response.json()['rounds']),2)
@@ -367,10 +379,12 @@ class LicenseTests(unittest.TestCase):
 
     def test_countersign_and_or_sign_do_not_advance_until_node_requirements_are_met(self):
         definition=json.loads(json.dumps(self.definition))
-        definition['steps'][0]['assignee']['user_ids']=[self.ids['reviewer'],self.ids['manager']]
+        definition['steps'].insert(0,{'id':'organization','name':'部门首审','type':'approval','mode':'any','assignee':{'source':'organization_manager'}})
+        definition['steps'][1]['assignee']['user_ids']=[self.ids['reviewer'],self.ids['manager']]
         for mode in ['all','any']:
-            definition['steps'][0]['mode']=mode;self.publish(definition)
+            definition['steps'][1]['mode']=mode;self.publish(definition)
             item_id=self.create()
+            self.assertEqual(self.act(item_id).status_code,200)
             self.assertEqual(self.act(item_id).status_code,200)
             data=self.read(item_id)
             self.assertEqual(data['current_node']['node_type'],'approval' if mode=='all' else 'license_approval')
@@ -408,15 +422,17 @@ class LicenseTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/licenses',json=self.body,headers=self.headers['owner']).status_code,409)
         with self.sessions() as db:self.assertEqual(len(db.scalars(select(LicenseRequest)).all()),0)
 
-    def test_role_revocation_blocks_pending_final_task_until_admin_transfers_it(self):
-        item_id=self.create();self.act(item_id)
+    def test_role_revocation_is_blocked_until_admin_transfers_pending_final_task(self):
+        item_id=self.create();self.assertEqual(self.act(item_id).status_code,200)
         task_id=self.task(item_id)['id']
-        changed=self.client.patch(f'/api/users/{self.ids["final"]}',json={'roles':['operator']},headers=self.headers['admin'])
+        changed=self.client.patch(f'/api/users/{self.ids["final"]}',json={'roles':['license_manager']},headers=self.headers['admin'])
         self.assertEqual(changed.status_code,200,changed.text)
-        self.assertEqual(self.act(item_id,'final').status_code,403)
         self.assertIsNone(self.read(item_id)['license_key'])
         transferred=self.client.post(f'/api/admin/tasks/{task_id}/reassign',json={'assignee_id':self.ids['replacement'],'reason':'原审批人岗位调整'},headers=self.headers['admin'])
         self.assertEqual(transferred.status_code,200,transferred.text)
+        changed=self.client.patch(f'/api/users/{self.ids["final"]}',json={'roles':['license_manager']},headers=self.headers['admin'])
+        self.assertEqual(changed.status_code,200,changed.text)
+        self.assertEqual(self.act(item_id,'final').status_code,403)
         self.assertEqual(self.issue(item_id,'replacement')[0].status_code,200)
         self.assertEqual(self.read(item_id)['final_approver_id'],self.ids['replacement'])
 
@@ -431,6 +447,7 @@ class LicenseTests(unittest.TestCase):
         matched=self.create(product='重点产品')
         self.assertEqual(self.read(matched)['current_node']['node_type'],'approval')
         other=self.create(product='普通产品')
+        self.assertEqual(self.act(other).status_code,200)
         data=self.read(other)
         self.assertEqual(data['current_node']['node_type'],'license_approval')
         self.assertIsNone(data['license_key'])
@@ -474,8 +491,8 @@ class LicenseTests(unittest.TestCase):
         self.assertEqual(data['rounds'][0]['snapshot']['project'],{'id':self.project_id,'name':'授权项目100%_'})
         with self.sessions() as db:
             owner=db.get(User,self.ids['owner']);owner.role_grants=[UserRole(role='operator')];db.commit()
-        self.assertEqual(self.client.get('/api/projects',headers=self.headers['owner']).json(),[])
-        self.assertEqual(self.client.post('/api/licenses',json=self.body,headers=self.headers['owner']).status_code,403)
+        self.assertTrue(self.client.get('/api/projects',headers=self.headers['owner']).json())
+        self.assertEqual(self.client.post('/api/licenses',json=self.body,headers=self.headers['owner']).status_code,201)
 
     def test_project_role_approval_uses_each_project_and_preserves_key_restrictions(self):
         with self.sessions() as db:
@@ -485,9 +502,12 @@ class LicenseTests(unittest.TestCase):
             db.commit()
         definition=json.loads(json.dumps(self.definition))
         definition['steps'][0]['assignee']={'source':'project_role','role':'project_manager'}
+        definition['steps'].insert(0,{'id':'organization','name':'部门首审','type':'approval','mode':'any','assignee':{'source':'organization_manager'}})
         self.publish(definition)
         first=self.create()
         second=self.create('other',project_id=self.other_project_id)
+        self.assertEqual(self.act(first).status_code,200)
+        self.assertEqual(self.act(second).status_code,200)
         self.assertEqual(self.task(first)['assignee_id'],self.ids['reviewer'])
         self.assertEqual(self.task(second)['assignee_id'],self.ids['replacement'])
         # A project change cannot rewrite an in-flight route or key readership.
@@ -551,14 +571,15 @@ class LicenseTests(unittest.TestCase):
         self.assertEqual(self.read(item_id)['status'],'generated')
 
     def test_new_and_reset_passwords_enforce_length_and_three_ascii_categories(self):
+        department_id=self.client.post('/api/departments',json={'name':'密码测试部'},headers=self.headers['admin']).json()['id']
         weak=['Aa1!short','abcdefghijkl','ABCDEFGHIJKL','123456789012','Abcdefghijkl','中文中文中文中文1234','abcdefghijkl ']
         for password in weak:
-            r=self.client.post('/api/users',json={'username':'newuser','display_name':'新成员','roles':['applicant','license_manager'],'password':password},headers=self.headers['admin'])
+            r=self.client.post('/api/users',json={'username':'newuser','display_name':'新成员','department_id':department_id,'roles':['applicant','license_manager'],'password':password},headers=self.headers['admin'])
             self.assertEqual(r.status_code,422,password)
             r=self.client.patch(f'/api/users/{self.ids["other"]}',json={'password':password},headers=self.headers['admin'])
             self.assertEqual(r.status_code,422,password)
         for index,password in enumerate(['Abcdefghi123','Abcdefghij!@','abcdefghi12!','ABCDEFGHI12!']):
-            r=self.client.post('/api/users',json={'username':f'newuser{index}','display_name':'新成员','roles':['applicant','license_manager'],'password':password},headers=self.headers['admin'])
+            r=self.client.post('/api/users',json={'username':f'newuser{index}','display_name':'新成员','department_id':department_id,'roles':['applicant','license_manager'],'password':password},headers=self.headers['admin'])
             self.assertEqual(r.status_code,200,r.text)
             self.assertEqual(set(r.json()['roles']),{'applicant','license_manager'})
             self.assertEqual(self.client.post('/api/login',json={'username':f'newuser{index}','password':password}).status_code,200)

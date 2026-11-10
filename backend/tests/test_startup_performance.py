@@ -71,7 +71,8 @@ class StartupQueriesTests(unittest.TestCase):
 
     def test_a_project_and_bootstrap_queries_stay_bounded(self):
         report = {'scope':'isolated SQLite, 22 projects; query counts, not host latency', 'requests':{}}
-        for path, maximum in [('/api/auth/options',3), ('/api/me',4), ('/api/projects',8)]:
+        # 组织授权增加固定批量查询：任命关系、岗位来源及多部门关系；岗位迁移再增加岗位模板批量查询，仍验证列表扩大不产生逐项目查询。
+        for path, maximum in [('/api/auth/options',3), ('/api/me',8), ('/api/projects',19)]:
             response, counts = self.measured(path)
             self.assertLessEqual(counts['sql'], maximum, path)
             report['requests'][path] = counts
@@ -98,16 +99,16 @@ class StartupQueriesTests(unittest.TestCase):
             member = db.get(User, uid)
             member.role = 'applicant'; member.role_grants = [UserRole(role='applicant')]
             db.commit()
-        self.assertEqual(self.client.get('/api/projects', headers=headers).json(), [])
+        self.assertEqual([p['id'] for p in self.client.get('/api/projects', headers=headers).json()], [project_id])
         projects = self.client.get('/api/projects', headers=self.headers).json()
         project = next(p for p in projects if p['id'] == project_id)
-        self.assertFalse(project['members'][0]['eligible'])
+        self.assertTrue(project['members'][0]['eligible'])
 
     def test_d_public_bootstrap_does_not_load_or_decrypt_private_settings(self):
         with patch('app.settings.decrypt_secret', side_effect=AssertionError('不应解密飞书密钥')):
             self.assertEqual(self.client.get('/projects').status_code, 404)
             options = self.client.get('/api/auth/options').json()
-        self.assertEqual(set(options), {'site_name','feishu_login_enabled','local_login_enabled'})
+        self.assertEqual(set(options), {'site_name','feishu_login_enabled','local_login_enabled','feishu_task_login_enabled'})
 
     def test_e_audits_are_committed_for_success_unauthorized_and_forbidden_requests(self):
         with self.sessions() as db:

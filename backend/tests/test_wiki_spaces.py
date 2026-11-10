@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app import main
 from app.database import Base, get_db
 from app.migrations import upgrade, seed_knowledge
-from app.models import AuditLog, User, UserRole, WikiArticle, WikiArticleVersion, WikiSpace, WikiSpaceMember
+from app.models import AuditLog, User, UserRole, WikiArticle, WikiArticleVersion, WikiSpace, WikiSpaceMember, WikiSpaceDepartment, Department, DepartmentMembership
 from app.rate_limit import RateDecision
 from app.security import make_token
 
@@ -72,6 +72,153 @@ class WikiSpaceTests(unittest.TestCase):
         response = self.request('post', '/wiki', who, json=payload)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
+
+    def setup_departments(self):
+        with self.sessions() as db:
+            root = Department(name='产品中心'); db.add(root); db.flush()
+            child = Department(name='产品研发', parent_id=root.id)
+            outside = Department(name='商务中心'); db.add_all([child, outside]); db.flush()
+            db.get(User, self.ids['other']).department_id = child.id
+            db.get(User, self.ids['curator']).department_id = outside.id
+            db.commit()
+            return root.id, child.id, outside.id
+
+    def assert_read(self, space, article, who, allowed):
+        expected = 200 if allowed else 404
+        for path in [f'/wiki/{article["id"]}', f'/wiki/{article["id"]}/versions', f'/wiki?space_id={space["id"]}']:
+            result = self.request('get', path, who)
+            self.assertEqual(result.status_code, expected, (path, result.text))
+        listed = self.request('get', '/wiki/spaces', who).json()
+        self.assertEqual(space['id'] in [row['id'] for row in listed], allowed)
+        found = self.request('get', '/wiki?scope=shared&q=PRIVATE_BODY_', who).json()
+        self.assertEqual(article['id'] in [row['id'] for row in found], allowed)
+
+    def test_all_scope_is_authenticated_readonly_and_shrinking_revokes_every_read(self):
+        space = self.create('owner', access_scope='all')
+        item = self.article(space=space)
+        for who in ['other', 'admin', 'curator']:
+            self.assert_read(space, item, who, True)
+            self.assertEqual(self.request('post', '/wiki', who, json={**item, 'title':'不能写'}).status_code, 403)
+            self.assertEqual(self.request('put', f'/wiki/{item["id"]}', who, json=item).status_code, 403)
+            self.assertEqual(self.request('put', f'/wiki/spaces/{space["id"]}', who, json=space).status_code, 403)
+        self.assertEqual(self.client.get(f'/api/wiki/{item["id"]}').status_code, 401)
+        self.assertEqual(self.request('get', f'/wiki/{item["id"]}', 'disabled').status_code, 401)
+        with self.sessions() as db:
+            from app.knowledge import accessible_spaces
+            self.assertEqual(db.scalars(select(WikiSpace.id).where(accessible_spaces(self.ids['disabled']))).all(), [])
+        updated = self.request('put', f'/wiki/spaces/{space["id"]}', json={**space, 'access_scope':'members'})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        for who in ['other', 'admin', 'curator']: self.assert_read(space, item, who, False)
+
+    def test_department_scope_hierarchy_multimembership_and_live_revocation(self):
+        root, child, outside = self.setup_departments()
+        space = self.create('owner', access_scope='departments', department_ids=[root])
+        item = self.article(space=space)
+        self.assert_read(space, item, 'other', True)
+        self.assert_read(space, item, 'curator', False)
+        space = self.request('put', f'/wiki/spaces/{space["id"]}', json={**space, 'include_subdepartments':False}).json()
+        self.assert_read(space, item, 'other', False)
+        with self.sessions() as db:
+            db.add(DepartmentMembership(user_id=self.ids['curator'], department_id=root)); db.commit()
+        self.assert_read(space, item, 'curator', True)
+        with self.sessions() as db:
+            db.delete(db.get(DepartmentMembership, (self.ids['curator'], root))); db.commit()
+        self.assert_read(space, item, 'curator', False)
+        self.request('put', f'/wiki/spaces/{space["id"]}', json={**space, 'include_subdepartments':True})
+        with self.sessions() as db:
+            db.get(User, self.ids['other']).department_id = outside; db.commit()
+        self.assert_read(space, item, 'other', False)
+        with self.sessions() as db:
+            db.get(User, self.ids['other']).department_id = child
+            db.get(Department, root).active = False; db.commit()
+        self.assert_read(space, item, 'other', False)
+
+    def test_selected_people_are_atomic_and_editor_grants_survive_range_changes(self):
+        space = self.create('owner', member_ids=[self.ids['other'], self.ids['other']])
+        item = self.article(space=space)
+        self.assert_read(space, item, 'other', True)
+        self.assert_read(space, item, 'admin', False)
+        member_path=f'/wiki/spaces/{space["id"]}/members/{self.ids["other"]}'
+        self.request('patch', member_path, json={'role':'editor'})
+        for scope in ['all', 'members']:
+            response = self.request('put', f'/wiki/spaces/{space["id"]}', json={**space, 'access_scope':scope, 'member_ids':[self.ids['other']]})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.request('get', f'/wiki/spaces/{space["id"]}/members').json()[0]['role'], 'editor')
+        self.request('put', f'/wiki/spaces/{space["id"]}', json={**space,'access_scope':'all'})
+        removed = self.request('delete', member_path)
+        self.assertTrue(removed.json()['still_has_access'])
+        self.assert_read(space, item, 'other', True)
+        self.assertEqual(self.request('post','/wiki','other',json={**item,'title':'只读'}).status_code,403)
+        self.request('put',f'/wiki/spaces/{space["id"]}',json={**space,'access_scope':'members','member_ids':[]})
+        self.assert_read(space, item, 'other', False)
+
+    def test_invalid_access_update_rolls_back_and_personal_space_cannot_open(self):
+        root, child, outside = self.setup_departments()
+        space = self.create('owner', member_ids=[self.ids['other']])
+        count = len(self.logs())
+        for patch_data in [{'access_scope':'departments','department_ids':[]},
+                           {'access_scope':'departments','department_ids':[root,999999]},
+                           {'access_scope':'all','member_ids':[self.ids['disabled']]},
+                           {'access_scope':'all','member_ids':[999999]}, {'department_ids':[-1]}]:
+            result = self.request('put',f'/wiki/spaces/{space["id"]}',json={**space,'name':'不应保存',**patch_data})
+            self.assertIn(result.status_code,[400,422],result.text)
+        with self.sessions() as db:
+            row=db.get(WikiSpace,space['id'])
+            self.assertEqual((row.name,row.access_scope),(space['name'],'members'))
+            self.assertIsNotNone(db.get(WikiSpaceMember,(space['id'],self.ids['other'])))
+            self.assertEqual(db.scalars(select(WikiSpaceDepartment)).all(),[])
+        self.assertEqual(len(self.logs()),count)
+        personal = next(row for row in self.request('get','/wiki/spaces').json() if row['kind']=='personal')
+        for values in [{'access_scope':'all'},{'department_ids':[root]},{'member_ids':[self.ids['other']]}]:
+            self.assertEqual(self.request('put',f'/wiki/spaces/{personal["id"]}',json={**personal,**values}).status_code,400)
+
+    def test_department_reference_blocks_deletion_until_owner_removes_it(self):
+        department=self.request('post','/departments','admin',json={'name':'知识库授权部门'}).json()
+        space=self.create('owner',access_scope='departments',department_ids=[department['id']])
+        impact=self.request('get',f'/departments/{department["id"]}/deletion-impact','admin').json()
+        self.assertEqual(impact['blockers'],[{'label':'知识库空间授权引用','count':1}])
+        self.assertEqual(self.request('delete',f'/departments/{department["id"]}?revision={department["revision"]}','admin').status_code,409)
+        changed=self.request('put',f'/wiki/spaces/{space["id"]}',json={**space,'access_scope':'members','department_ids':[]})
+        self.assertEqual(changed.status_code,200,changed.text)
+        self.assertEqual(self.request('delete',f'/departments/{department["id"]}?revision={department["revision"]}','admin').status_code,200)
+
+    def test_old_clients_preserve_scope_and_department_cycles_do_not_break_reads(self):
+        root,child,outside=self.setup_departments()
+        space=self.create('owner',access_scope='departments',department_ids=[root])
+        item=self.article(space=space)
+        legacy={k:space[k] for k in ['key','name','description','category','kind','owner_id']}
+        updated=self.request('put',f'/wiki/spaces/{space["id"]}',json={**legacy,'name':'兼容旧客户端'})
+        self.assertEqual(updated.status_code,200,updated.text)
+        self.assertEqual(updated.json()['department_ids'],[root])
+        self.assertEqual(updated.json()['access_scope'],'departments')
+        with self.sessions() as db:
+            db.get(Department,root).parent_id=child;db.commit()
+        self.assert_read(space,item,'other',True)
+
+    def test_access_choices_exclude_disabled_and_no_private_account_fields(self):
+        root, child, outside = self.setup_departments()
+        result = self.request('get','/wiki/access-options?q=other').json()
+        self.assertEqual([p['id'] for p in result['people']],[self.ids['other']])
+        self.assertEqual(set(result['people'][0]),{'id','display_name','username','active','department'})
+        self.assertEqual(next(d['path'] for d in result['departments'] if d['id']==child),'产品中心 / 产品研发')
+        self.assertEqual(self.client.get('/api/wiki/access-options').status_code,401)
+
+    def test_scope_changes_are_audited_and_audit_visibility_follows_department_scope(self):
+        root, child, outside = self.setup_departments()
+        space = self.create('owner', access_scope='departments', department_ids=[root])
+        result=self.request('get','/audit?target_type=wiki_space','admin').json()
+        self.assertNotIn(str(space['id']),[str(row['target_id']) for row in result['items']])
+        self.request('put',f'/wiki/spaces/{space["id"]}',json={**space,'access_scope':'all','include_subdepartments':False})
+        logs=self.logs()
+        changes=json.loads(logs[-1].changes)
+        self.assertIn('开放范围',str(changes))
+        result=self.request('get','/audit?target_type=wiki_space','admin').json()
+        self.assertIn(str(space['id']),[str(row['target_id']) for row in result['items']])
+        self.client.request('DELETE',f'/api/wiki/spaces/{space["id"]}',headers=self.headers['owner'],json={'confirm_name':space['name']})
+        result=self.request('get','/audit?target_type=wiki_space','admin').json()
+        self.assertNotIn(str(space['id']),[str(row['target_id']) for row in result['items']])
+        restored=self.request('post',f'/wiki/spaces/{space["id"]}/restore')
+        self.assertEqual(restored.json()['access_scope'],'all')
 
     def test_personal_library_is_automatic_unique_and_hidden_even_from_administrators(self):
         article = self.article()
@@ -290,7 +437,8 @@ class WikiSpaceTests(unittest.TestCase):
         self.assertEqual(self.request('get', '/audit?target_type=wiki', 'admin').json()['total'], 0)
 
     def test_new_users_get_personal_space_in_same_transaction(self):
-        response = self.request('post','/users','admin',json={'username':'newuser','display_name':'新成员','password':'StrongPass123!','roles':['applicant']})
+        department=self.request('post','/departments','admin',json={'name':'账号部门'}).json()
+        response = self.request('post','/users','admin',json={'username':'newuser','display_name':'新成员','department_id':department['id'],'password':'StrongPass123!','roles':['applicant']})
         self.assertEqual(response.status_code,200,response.text)
         with self.sessions() as db:
             space=db.scalar(select(WikiSpace).where(WikiSpace.personal_user_id==response.json()['id']))
@@ -303,7 +451,7 @@ class WikiMigrationTests(unittest.TestCase):
         metadata = MetaData()
         for name in ['users', 'wiki_articles', 'wiki_spaces']:
             table = Table(name, metadata)
-            omitted = {'wiki_articles': {'space_id', 'parent_id', 'status', 'version', 'revision'}, 'wiki_spaces': {'owner_id','kind','personal_user_id','members_initialized'}}.get(name, set())
+            omitted = {'wiki_articles': {'space_id', 'parent_id', 'status', 'version', 'revision'}, 'wiki_spaces': {'owner_id','kind','personal_user_id','members_initialized','access_scope','include_subdepartments'}}.get(name, set())
             for col in Base.metadata.tables[name].columns:
                 if col.name not in omitted: table.append_column(col._copy())
         metadata.create_all(engine)
@@ -320,6 +468,8 @@ class WikiMigrationTests(unittest.TestCase):
             self.assertEqual((article.space_id, article.version, article.status), (default.id, 1, 'published'))
             self.assertEqual(article.revision, 1)
             self.assertEqual(db.get(WikiSpace, 10).owner_id, 1)
+            self.assertEqual(db.get(WikiSpace, 10).access_scope, 'members')
+            self.assertTrue(db.get(WikiSpace, 10).include_subdepartments)
             original = db.scalar(select(WikiArticleVersion))
             self.assertEqual((original.content, original.author_id, original.created_at.isoformat()),
                              ('保留原文', 2, '2026-01-02T03:04:05'))

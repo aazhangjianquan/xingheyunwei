@@ -25,7 +25,7 @@ function harness({get,post,put,patch,del}={}) {
     defineEmits:()=>((name,text)=>notices.push(text)),onMounted:fn=>mount=fn,onBeforeUnmount:fn=>unmount=fn,
     window:{addEventListener(){},removeEventListener(){},localStorage:{getItem:key=>drafts.get(key)||null,setItem:(key,value)=>drafts.set(key,value),removeItem:key=>drafts.delete(key)}},
     setTimeout:(fn,delay)=>{const id=setTimeout(fn,delay);timers.add(id);return id},clearTimeout,
-    get:async(path,options)=>{calls.push(['get',path,options]);if(get)return get(path,options);if(path==='/wiki/spaces')return [personal,shared];if(path.includes('/candidates'))return [];if(path.includes('/members'))return [];if(path.endsWith('/versions'))return [];if(/^\/wiki\/\d+$/.test(path))return article;return []},
+    get:async(path,options)=>{calls.push(['get',path,options]);if(get)return get(path,options);if(path==='/wiki/spaces')return [personal,shared];if(path.startsWith('/wiki/access-options'))return {departments:[],people:[]};if(path.includes('/candidates'))return [];if(path.includes('/members'))return [];if(path.endsWith('/versions'))return [];if(/^\/wiki\/\d+$/.test(path))return article;return []},
     post:async(path,body)=>{calls.push(['post',path,body]);return post?post(path,body):shared},
     put:async(path,body)=>{calls.push(['put',path,body]);return put?put(path,body):shared},
     patch:async(path,body)=>{calls.push(['patch',path,body]);return patch?patch(path,body):{}},
@@ -56,7 +56,7 @@ test('readonly members have no create/edit/manage buttons while owners have memb
 })
 test('inline public library creation preserves article draft and selects the committed space',async()=>{
   const h=harness()
-  try{await h.s.loadSpaces();h.s.newArticle();h.s.articleForm.value.title='保留的标题';h.s.articleForm.value.content='保留的正文';h.s.newSpace();h.s.spaceForm.value={key:'SRE',name:'团队知识库',description:''};await h.s.saveSpace();assert.equal(h.s.modal.value,'create');assert.equal(h.s.articleForm.value.space_id,2);assert.equal(h.s.articleForm.value.title,'保留的标题');assert.equal(h.s.articleForm.value.content,'保留的正文');assert.equal(h.calls.filter(c=>c[0]==='post').length,1);assert.equal(h.calls.filter(c=>c[0]==='get').length,1)}finally{h.dispose()}
+  try{await h.s.loadSpaces();h.s.newArticle();h.s.articleForm.value.title='保留的标题';h.s.articleForm.value.content='保留的正文';h.s.newSpace();h.s.spaceForm.value={key:'SRE',name:'团队知识库',description:''};await h.s.saveSpace();assert.equal(h.s.modal.value,'create');assert.equal(h.s.articleForm.value.space_id,2);assert.equal(h.s.articleForm.value.title,'保留的标题');assert.equal(h.s.articleForm.value.content,'保留的正文');assert.equal(h.calls.filter(c=>c[0]==='post').length,1);assert.equal(h.calls.filter(c=>c[0]==='get'&&c[1]==='/wiki/spaces').length,1)}finally{h.dispose()}
 })
 test('cancel space creation retains draft, errors retain space form and double saves submit once',async()=>{
   let finish
@@ -147,7 +147,7 @@ test('editor preview renders unsaved text without changing the draft, writing or
 })
 test('failed reload of a conflicting document retains the current editor and draft',async()=>{
   let offline=false
-  const h=harness({get:path=>{if(path==='/wiki/spaces')return [personal,shared];if(offline)throw new Error('网络暂不可用');return article}})
+  const h=harness({get:path=>{if(path==='/wiki/spaces')return [personal,shared];if(path.startsWith('/wiki/access-options'))return {departments:[],people:[]};if(offline)throw new Error('网络暂不可用');return article}})
   try {
     await h.s.loadSpaces();await h.s.openArticle(article,true)
     h.s.articleForm.value.content='不能丢失的本地内容';h.s.editor.conflict.value=true
@@ -181,4 +181,68 @@ test('unmounted user session ignores pending space responses',async()=>{
   let finish
   const h=harness({get:()=>new Promise(resolve=>finish=resolve)})
   const pending=h.s.loadSpaces();h.dispose();finish([personal,shared]);await pending;assert.deepEqual(h.s.spaces.value,[])
+})
+
+test('shared creation offers all scopes, validates department selection and preserves member picks across scopes',async()=>{
+  const h=harness()
+  try {
+    h.s.newSpace();await tick()
+    assert.equal(h.s.spaceForm.value.access_scope,'members')
+    assert.equal(h.s.spaceForm.value.include_subdepartments,true)
+    const html=await h.html()
+    for(const label of ['所有人','指定部门','指定人员'])assert.match(html,new RegExp(label))
+    h.s.spaceForm.value.name='部门资料';h.s.spaceForm.value.access_scope='departments'
+    await h.s.saveSpace();assert.match(h.s.formError.value,/至少选择一个/)
+    assert.equal(h.calls.filter(c=>c[0]==='post').length,0)
+    h.s.toggleAccess('department_ids',8);h.s.toggleAccess('member_ids',77)
+    h.s.spaceForm.value.access_scope='all'
+    assert.match(await h.html(),/原有文档也会开放/)
+    h.s.spaceForm.value.access_scope='departments';await h.s.saveSpace()
+    const payload=h.calls.find(c=>c[0]==='post')[2]
+    assert.equal(payload.access_scope,'departments');assert.deepEqual(payload.department_ids,[8]);assert.deepEqual(payload.member_ids,[77])
+  }finally{h.dispose()}
+})
+test('settings retains explicit editors and scope when opening, while personal library has no access choices',async()=>{
+  const h=harness({get:p=>p.endsWith('/members')?[{user_id:77,display_name:'编辑人员',active:true,role:'editor'}]:p.startsWith('/wiki/access-options')?{departments:[{id:8,name:'研发部'}],people:[]}:[]})
+  try {
+    h.s.spaces.value=[personal,{...shared,access_scope:'departments',include_subdepartments:false,department_ids:[8],access_members:[{id:77,display_name:'编辑人员',role:'editor'}]}]
+    await h.s.settings(h.s.spaces.value[1]);await tick()
+    assert.deepEqual(h.s.spaceForm.value.member_ids,[77]);assert.equal(h.s.spaceForm.value.include_subdepartments,false)
+    assert.match(await h.html(),/编辑人员 · 编辑/)
+    h.s.toggleAccess('member_ids',77);assert.deepEqual(h.s.spaceForm.value.member_ids,[])
+    await h.s.settings(personal)
+    assert.doesNotMatch(await h.html(),/name="kb-access-scope"/)
+  }finally{h.dispose()}
+})
+test('range save failure retains all selected values and directory failure never changes the current authorization',async()=>{
+  const h=harness({get:()=>{throw new Error('目录暂不可用')},post:()=>{throw new Error('保存失败')}})
+  try {
+    h.s.newSpace();await tick();h.s.spaceForm.value.name='不能丢失'
+    h.s.toggleAccess('member_ids',77);h.s.toggleAccess('department_ids',8);h.s.spaceForm.value.access_scope='departments'
+    await h.s.saveSpace();assert.deepEqual(h.s.spaceForm.value.member_ids,[77]);assert.deepEqual(h.s.spaceForm.value.department_ids,[8])
+    assert.equal(h.s.modal.value,'new-space');assert.equal(h.s.saving.value,false)
+    assert.match(h.s.accessError.value,/目录暂不可用/);assert.match(h.s.formError.value,/保存失败/)
+  }finally{h.dispose()}
+})
+test('directory searches retain selected people outside the result limit and ignore stale responses',async()=>{
+  let resolveFirst
+  const h=harness({get:()=>new Promise(resolve=>resolveFirst=resolve)})
+  try {
+    h.s.newSpace();h.s.selectedPeople.value[77]={id:77,display_name:'保留人员'};h.s.toggleAccess('member_ids',77)
+    const pending=h.s.loadAccessOptions();resolveFirst({departments:[],people:[{id:78,display_name:'其他人员'}]});await pending
+    assert.equal(h.s.selectedAccessPeople.value[0].display_name,'保留人员')
+    const late=h.s.loadAccessOptions();h.s.close();resolveFirst({departments:[],people:[{id:99,display_name:'过期结果'}]});await late
+    assert.equal(h.s.accessOptions.value.people.some(p=>p.id===99),false)
+  }finally{h.dispose()}
+})
+test('removing a direct member accurately reports remaining range access',async()=>{
+  const h=harness({del:()=>({ok:true,still_has_access:true})})
+  try {
+    h.s.spaces.value=[personal,shared];await h.s.settings(shared);await tick()
+    h.s.spaceForm.value.member_ids=[77];await h.s.mutateMember('remove',{user_id:77})
+    assert.ok(h.notices.includes('直接授权已移除，该成员仍可通过开放范围阅读'))
+    assert.deepEqual(h.s.spaceForm.value.member_ids,[])
+    h.s.removeTarget.value={display_name:'某人'};h.s.tab.value='members'
+    assert.match(await h.html(),/若仍属于全员或部门开放范围/)
+  }finally{h.dispose()}
 })

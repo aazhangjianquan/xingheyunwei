@@ -1,3 +1,4 @@
+from . import project_positions as project_positions
 import secrets
 import os
 import json
@@ -25,7 +26,9 @@ from .workflows import FLOWS, assignee, make_approval, seed_assignments, validat
 from .auth_feishu import register_routes
 from .roles import (ROLES, role_ids, effective_role_ids, has_role, canonical_role,
                     role_aliases, role_name, managed_roles, ROLE_ALIASES,
-                    MANAGER_ROLE_SCOPE, stored_role_ids)
+                    stored_role_ids)
+from .roles import direct_role_ids, can_manage_people, RETIRED_HEAD_ROLES
+from . import organization as org
 from .models import UserRole, Project, ProjectMember, WorkflowInstance, WorkflowNode, TaskTransfer, LicenseRequest
 from . import flow_engine as flow
 from . import audit as operation_audit
@@ -85,6 +88,7 @@ def initialize_database():
     finish_upgrade(engine)
     with SessionLocal() as db:
         seed(db)
+        org.seed_organization(db)
         seed_assignments(db)
         for approval in db.scalars(select(Approval).where(Approval.action == "pending", Approval.assignee_id.is_(None))).all():
             item = db.get(OBJECTS[approval.object_type], approval.object_id)
@@ -94,8 +98,14 @@ def initialize_database():
         from .flow_api import seed_demo
         if demo_enabled():
             seed_demo(db)
+        org.seed_organization(db)
         from .licenses import seed_license_workflow
         seed_license_workflow(db)
+        org.migrate_business_grants_to_positions(db)
+        flow.upgrade_organization_approval_defaults(db)
+        flow.upgrade_department_first_approval(db)
+        from .project_position_upgrade import upgrade_project_positions
+        upgrade_project_positions(db, OBJECTS)
         seed_knowledge(db)
         resource_catalog.seed(db)
         for key, default in settings.DEFAULTS.items():
@@ -186,27 +196,23 @@ def user_out(user: User):
             "canonical_roles": effective_role_ids(user),
             "role_name": " / ".join(role_name(r) for r in grants),
             "feishu_open_id": mask_open_id(user.feishu_open_id),
-            "feishu_open_id_set": bool(user.feishu_open_id), "active": user.active}
+            "feishu_open_id_set": bool(user.feishu_open_id), "active": user.active,
+            **org.organization_info(user)}
 
 
-def valid_role_grants(grants):
+def valid_role_grants(grants, existing=()):
     values = list(dict.fromkeys(canonical_role(r) for r in grants))
     if not values or any(r not in ROLES for r in values):
         raise HTTPException(400, '至少选择一个有效角色')
+    preserved = {canonical_role(r) for r in existing}
+    from .roles import SYSTEM_ROLES
+    if (set(values) - SYSTEM_ROLES) - preserved:
+        raise HTTPException(422, '成员只可直接分配基础与系统角色；业务权限请在部门管理中分配岗位，负责人请通过部门任命')
     return values
 
 
 def can_manage_user_roles(actor: User, target: User | None = None):
-    if has_role(actor, 'admin'):
-        return True
-    if not target or not target.active or has_role(target, 'admin') or actor.id == target.id or not actor.department.strip() or actor.department != target.department:
-        return False
-    return bool(managed_roles(actor))
-
-
-def validate_role_department(grants, department):
-    if set(grants) & set(MANAGER_ROLE_SCOPE) and not department.strip():
-        raise HTTPException(400, '请先填写所属部门，负责人权限按所属部门生效')
+    return has_role(actor, 'admin')
 
 
 def open_id_taken(db: Session, value: str, exclude_id: int | None = None):
@@ -233,15 +239,15 @@ def iso(value: datetime):
 
 def visible(query, model, user: User):
     query = query.where(model.deleted_at.is_(None))
-    if has_role(user, 'admin', 'ops_head', 'manager', 'operator'):
+    if has_role(user, 'admin'):
         return query
     owner = 'applicant_id' if model is ResourceRequest else 'owner_id'
     kind = next(k for k, m in OBJECTS.items() if m is model)
-    project_ids = select(ProjectMember.project_id).where(ProjectMember.user_id == user.id, ProjectMember.role.in_(stored_role_ids(user)))
+    project_ids = select(ProjectMember.project_id).where(ProjectMember.user_id == user.id, ProjectMember.role.in_(set(project_positions.POSITIONS) | {'project_owner','sales_presales','department_head'}))
     assigned = select(Approval.object_id).where(Approval.object_type == kind, or_(Approval.assignee_id == user.id, Approval.actor_id == user.id))
     conditions = [getattr(model, owner) == user.id, model.project_id.in_(project_ids), model.id.in_(assigned)]
     if has_role(user, 'department_head'):
-        conditions.append(getattr(model, owner).in_(select(User.id).where(User.department == user.department)))
+        conditions.append(getattr(model, owner).in_(select(User.id).where(org.department_scope(User, user))))
     return query.where(or_(*conditions))
 
 
@@ -417,62 +423,56 @@ def page_result(db, query, page, page_size, render):
 def list_users(page: int | None = Query(None, ge=1), page_size: int = Query(10),
                q: str = Query('', max_length=100), status: Literal['all', 'enabled', 'disabled'] = 'all',
                role: str = Query('all', max_length=60), department: str = Query('', max_length=100),
+               department_id: int | None = Query(None, gt=0), include_descendants: bool = False,
                db: Session = Depends(get_db), user: User = Depends(current_user)):
     if page_size not in {10, 20, 50}: raise HTTPException(422, '每页条数仅支持 10、20、50')
     query = select(User).order_by(User.id)
     if not has_role(user, "admin"):
-        if page is None or not managed_roles(user):
+        if page is None or not can_manage_people(user):
             query = query.where(User.active == True)
         # Scoped department leaders only need the people they can administer;
         # keeping this filter server-side prevents cross-department disclosure.
-        if page is not None and managed_roles(user):
-            query = query.where(User.department == user.department)
+        if page is not None and can_manage_people(user):
+            query = query.where(org.membership_filter(User, org.managed_department_ids(user)))
     if status != 'all': query = query.where(User.active == (status == 'enabled'))
-    if department.strip(): query = query.where(User.department == department.strip())
+    if department.strip():
+        selected_department = org.find_department(db, department.strip())
+        query = query.where(org.membership_filter(User, {selected_department.id}) if selected_department else User.department == department.strip())
+    if department_id is not None:
+        ids = org.descendant_ids(db, department_id) if include_descendants else {department_id}
+        query = query.where(org.membership_filter(User, ids))
     if role != 'all':
         if role not in ROLES and role not in ROLE_ALIASES: raise HTTPException(422, '无效的角色筛选')
-        aliases = role_aliases(role)
-        query = query.where(or_(*[User.role_grants.any(UserRole.role == value) for value in aliases],
-                               ~User.role_grants.any() & User.role.in_(aliases)))
+        query = query.where(org.role_filter(role))
     if q.strip():
-        fields = [User.display_name, User.department] + ([User.username] if has_role(user, 'admin') or page is not None and managed_roles(user) else [])
+        fields = [User.display_name, User.department] + ([User.username] if has_role(user, 'admin') or page is not None and can_manage_people(user) else [])
         query = query.where(or_(*(field.icontains(q.strip(), autoescape=True) for field in fields)))
     def render(person):
         data = user_out(person)
         data['can_manage_roles'] = can_manage_user_roles(user, person)
         data['managed_roles'] = sorted(managed_roles(user)) if data['can_manage_roles'] else []
-        return data if has_role(user, 'admin') else {k: v for k, v in data.items() if k not in {'feishu_open_id', 'feishu_open_id_set'} and (k != 'username' or page is not None and managed_roles(user))}
+        data['can_manage_organization'] = org.may_manage_member(user, person)
+        if not has_role(user, 'admin'):
+            data = {k: v for k, v in data.items() if k not in {'feishu_open_id', 'feishu_open_id_set'} and (k != 'username' or page is not None and can_manage_people(user))}
+        return data
     # Unpaged responses are retained for project/workflow member selectors.
     if page is not None: return page_result(db, query, page, page_size, render)
     return [render(person) for person in db.scalars(query)]
 
 
-@app.get('/api/departments')
-def list_departments(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    if not has_role(user, 'admin') and not managed_roles(user):
-        raise HTTPException(403, '当前角色无权查看部门管理')
-    query = select(User).where(User.department != '')
-    if not has_role(user, 'admin'):
-        query = query.where(User.department == user.department)
-    departments = {}
-    for person in db.scalars(query.order_by(User.department, User.id)):
-        item = departments.setdefault(person.department, {'name': person.department, 'member_count': 0, 'heads': []})
-        item['member_count'] += 1
-        heads = set(effective_role_ids(person)) & (set(MANAGER_ROLE_SCOPE) | {'department_head'})
-        if person.active and heads:
-            item['heads'].append({'id': person.id, 'name': person.display_name,
-                                  'roles': sorted(heads), 'role_names': [role_name(r) for r in sorted(heads)]})
-    if has_role(user, 'admin'):
-        for name in db.scalars(select(Project.department).distinct()):
-            if name:
-                departments.setdefault(name, {'name': name, 'member_count': 0, 'heads': []})
-    return sorted(departments.values(), key=lambda item: item['name'])
+org.register_routes(app, current_user)
+
+# 具体路径先于 /api/{kind}/{item_id} 通用单据路由注册。
+from .personal_reminders import register_routes as register_personal_reminder_routes
+register_personal_reminder_routes(app, current_user)
 
 
 class UserIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     username: str = Field(min_length=2, max_length=80)
     display_name: str = Field(min_length=1, max_length=80)
-    department: str = Field(default='', max_length=100)
+    department_id: int | None = None
+    position_ids: list[int] = []
     role: str = "applicant"
     roles: list[str] | None = None
     password: str = Field(min_length=12, max_length=128)
@@ -486,9 +486,12 @@ class UserIn(BaseModel):
 
 @app.post("/api/users")
 def create_user(data: UserIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    org.write_lock(db, user)
     require_role(user, "admin")
+    department = org.require_department(db, data.department_id)
     grants = valid_role_grants(data.roles if data.roles is not None else [data.role])
-    validate_role_department(grants, data.department)
+    if 'department_head' in grants:
+        raise HTTPException(422, '请在部门管理中指定部门负责人')
     if db.scalar(select(User).where(User.username == data.username)):
         raise HTTPException(400, "角色无效或用户名已存在")
     open_id = data.feishu_open_id.strip() if data.feishu_open_id else None
@@ -496,10 +499,11 @@ def create_user(data: UserIn, db: Session = Depends(get_db), user: User = Depend
         raise HTTPException(400, '请填写完整的飞书 open_id，不能使用页面上的密文')
     if open_id and open_id_taken(db, open_id):
         raise HTTPException(409, "飞书身份已绑定其他成员")
-    item = User(username=data.username, display_name=data.display_name, department=data.department.strip(), role=grants[0], password_hash=hash_password(data.password), feishu_open_id=open_id)
+    item = User(username=data.username, display_name=data.display_name, department=department.name, department_id=department.id, organization_department=department, role=grants[0], password_hash=hash_password(data.password), feishu_open_id=open_id)
     item.role_grants = [UserRole(role=r) for r in grants]
     db.add(item)
     db.flush()
+    org.assign_organization(db, user, item, department.id, data.position_ids)
     from .knowledge import ensure_personal_space
     ensure_personal_space(db, item)
     operation_audit.record(db, user, 'create', 'user', item, extra={'password': (None, '已设置')})
@@ -509,8 +513,11 @@ def create_user(data: UserIn, db: Session = Depends(get_db), user: User = Depend
 
 
 class UserUpdate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     display_name: str | None = None
-    department: str | None = Field(default=None, max_length=100)
+    department_id: int | None = None
+    position_ids: list[int] | None = None
+    organization_revision: int | None = None
     role: str | None = None
     roles: list[str] | None = None
     feishu_open_id: str | None = None
@@ -527,32 +534,22 @@ class UserUpdate(BaseModel):
 
 @app.patch("/api/users/{item_id}")
 def update_user(item_id: int, data: UserUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    item = db.scalar(select(User).where(User.id == item_id).with_for_update())
+    item = org.write_lock(db, user, [item_id]).get(item_id)
     if not item:
         raise HTTPException(404, "用户不存在")
-    scoped_editor = not has_role(user, 'admin') and can_manage_user_roles(user, item)
-    if not has_role(user, 'admin') and not scoped_editor:
-        raise HTTPException(403, '当前角色无权管理该成员')
-    if scoped_editor:
-        changed = set(data.model_dump(exclude_unset=True)) - {'roles', 'role'}
-        if changed:
-            raise HTTPException(403, '部门负责人只能调整职责范围内的成员角色')
-        if data.roles is None and data.role is None:
-            raise HTTPException(400, '负责人只能修改成员角色')
+    if 'department_id' in data.model_fields_set and data.department_id is None:
+        raise HTTPException(422, '所属部门不能为空，请选择已有部门')
+    require_role(user, 'admin')
     before = operation_audit.snapshot(db, 'user', item)
-    grants = data.roles if data.roles is not None else ([data.role] if data.role is not None else role_ids(item))
-    grants = valid_role_grants(grants)
-    if data.department is not None or data.roles is not None or data.role is not None:
-        validate_role_department(grants, data.department if data.department is not None else item.department)
-    if scoped_editor:
-        allowed = managed_roles(user)
-        current_effective = set(canonical_role(r) for r in role_ids(item))
-        requested_effective = set(canonical_role(r) for r in grants)
-        if not (requested_effective - current_effective) <= allowed or (current_effective - requested_effective) - allowed:
-            raise HTTPException(403, '只能调整负责人职责范围内的岗位，其他角色请由系统管理员维护')
-        # Keep grants outside the manager scope even if a stale client omitted
-        # them from the submitted multi-select.
-        grants = list(dict.fromkeys([canonical_role(r) for r in role_ids(item) if canonical_role(r) not in allowed] + grants))
+    grants = data.roles if data.roles is not None else ([data.role] if data.role is not None else direct_role_ids(item))
+    grants = valid_role_grants(grants, existing=direct_role_ids(item))
+    if 'department_head' in grants and 'department_head' not in direct_role_ids(item):
+        raise HTTPException(422, '请在部门管理中指定部门负责人')
+    if data.department_id is not None or data.position_ids is not None:
+        if data.organization_revision is None:
+            raise HTTPException(422, '请提交成员组织修订号，刷新后重试')
+        org.assign_organization(db, user, item, data.department_id if data.department_id is not None else item.department_id,
+                                data.position_ids if data.position_ids is not None else [g.position_id for g in item.position_grants if g.department_id == (data.department_id if data.department_id is not None else item.department_id)], data.organization_revision)
     if has_role(item, 'admin') and ('admin' not in grants or data.active is False):
         admins = [u for u in db.scalars(select(User).where(User.active == True)).all() if has_role(u, 'admin')]
         if len(admins) <= 1:
@@ -560,7 +557,7 @@ def update_user(item_id: int, data: UserUpdate, db: Session = Depends(get_db), u
     item.role_grants = [UserRole(role=r) for r in grants]
     item.role = grants[0]
     for key, value in data.model_dump(exclude_unset=True).items():
-        if key in {"roles", "role"}:
+        if key in {"roles", "role", "department_id", "position_ids", "organization_revision"}:
             continue
         if key == "feishu_open_id":
             value = value.strip() if value else None
@@ -572,12 +569,9 @@ def update_user(item_id: int, data: UserUpdate, db: Session = Depends(get_db), u
             raise HTTPException(400, "角色无效")
         if key == "password":
             item.password_hash = hash_password(value)
-        elif key == 'department':
-            if value is None:
-                raise HTTPException(400, '所属部门不能为 null')
-            item.department = value.strip()
         else:
             setattr(item, key, value)
+    org.protect_pending_tasks(db)
     action = 'disable' if before['active'] and not item.active else 'enable' if not before['active'] and item.active else 'update'
     operation_audit.record(db, user, action, 'user', item, before=before,
                            extra={'password': (None, '已重置')} if data.password is not None else None)
@@ -586,6 +580,7 @@ def update_user(item_id: int, data: UserUpdate, db: Session = Depends(get_db), u
 
 
 class ResourceIn(BaseModel):
+    application_department_id: int | None = Field(default=None, gt=0)
     project_id: int
     project_name: str = ""
     environment: Literal["POC", "测试", "生产"]
@@ -690,6 +685,7 @@ def resources(options: ListQuery = Depends(list_query), db: Session = Depends(ge
 
 @app.post("/api/resources")
 def create_resource(data: ResourceIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    org.write_lock(db, user, track_pending=False)
     if data.end_date < data.start_date:
         raise HTTPException(400, "资源类型或使用期限无效")
     specification, specification_values = resource_catalog.validate_values(db, data.resource_type, data.specification_values, data.specification)
@@ -710,6 +706,7 @@ def resource_detail(item_id: int, db: Session = Depends(get_db), user: User = De
 
 
 class ChangeIn(BaseModel):
+    application_department_id: int | None = Field(default=None, gt=0)
     project_id: int
     environment: Literal["POC", "测试", "生产"] = "生产"
     name: str = Field(min_length=1)
@@ -735,11 +732,12 @@ def changes(options: ListQuery = Depends(list_query), db: Session = Depends(get_
 
 @app.post("/api/changes")
 def create_change(data: ChangeIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    org.write_lock(db, user, track_pending=False)
     if data.window_end <= data.window_start:
         raise HTTPException(400, "维护窗口结束时间必须晚于开始时间")
     if data.ops_owner_id:
         ops = db.get(User, data.ops_owner_id)
-        if not ops or not ops.active or not has_role(ops, "operator", "ops_head"):
+        if not ops or not ops.active or not project_positions.appointed(ops,data.project_id,"operator","ops_head"):
             raise HTTPException(400, "运维负责人无效")
     payload = data.model_dump()
     payload.update(plan="", rollback_plan="", implementation="")
@@ -757,6 +755,7 @@ def change_detail(item_id: int, db: Session = Depends(get_db), user: User = Depe
 
 
 class DeliveryIn(BaseModel):
+    application_department_id: int | None = Field(default=None, gt=0)
     project_id: int
     name: str = Field(min_length=1)
     customer: str = Field(min_length=1)
@@ -779,6 +778,7 @@ def deliveries(options: ListQuery = Depends(list_query), db: Session = Depends(g
 
 @app.post("/api/deliveries")
 def create_delivery(data: DeliveryIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    org.write_lock(db, user, track_pending=False)
     item = DeliveryProject(**data.model_dump(), owner_id=user.id, code="DEL-" + secrets.token_hex(12))
     db.add(item)
     db.flush()
@@ -802,7 +802,8 @@ def add_credential(item_id: int, db: Session = Depends(get_db), user: User = Dep
 @app.get("/api/deliveries/{item_id}/credentials/{credential_id}/reveal")
 def reveal_credential(item_id: int, credential_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     project = db.get(DeliveryProject, item_id)
-    if not project or (not has_role(user, "admin", "operator") and project.owner_id != user.id):
+    if not project or (not has_role(user, "admin") and project.owner_id != user.id and
+                       not project_positions.appointed(user, project.project_id, 'operator')):
         raise HTTPException(403, "无权查看此凭据")
     credential = db.get(DeliveryCredential, credential_id)
     if not credential or credential.project_id != item_id:
@@ -847,6 +848,7 @@ class ActionIn(BaseModel):
 
 @app.post('/api/{kind}/{item_id}/action')
 def workflow_action(kind: str, item_id: int, data: ActionIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    org.write_lock(db, user, track_pending=False)
     if kind not in OBJECTS: raise HTTPException(404, '流程类型不存在')
     item = db.scalar(select(OBJECTS[kind]).where(OBJECTS[kind].id == item_id, OBJECTS[kind].deleted_at.is_(None)).with_for_update())
     if not item: raise HTTPException(404, '申请单不存在')
@@ -930,6 +932,7 @@ def tasks(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), 
 
 
 def resubmit(kind, item_id, data, tasks, db, user):
+    org.write_lock(db, user, track_pending=False)
     item = db.scalar(select(OBJECTS[kind]).where(OBJECTS[kind].id == item_id, OBJECTS[kind].deleted_at.is_(None)).with_for_update())
     if not item or flow.owner_id(kind, item) != user.id: raise HTTPException(403, '只有申请人可以修改重提')
     if item.status != 'rejected': raise HTTPException(409, '只有已驳回单据可以修改重提')
@@ -985,6 +988,10 @@ def notifications(page: int | None = Query(None, ge=1), page_size: int = Query(1
                   db: Session = Depends(get_db), user: User = Depends(current_user)):
     if page_size not in {10, 20, 50}: raise HTTPException(422, '每页条数仅支持 10、20、50')
     query = select(NotificationLog).order_by(NotificationLog.id.desc())
+    from .models import PersonalReminder
+    query = query.where(or_(NotificationLog.object_type != 'personal_reminder',
+        NotificationLog.recipient_id == user.id,
+        NotificationLog.object_id.in_(select(PersonalReminder.id).where(PersonalReminder.owner_id == user.id))))
     if not has_role(user, "admin"):
         query = query.where(NotificationLog.recipient_id == user.id)
     if status != 'all': query = query.where(NotificationLog.status == status)

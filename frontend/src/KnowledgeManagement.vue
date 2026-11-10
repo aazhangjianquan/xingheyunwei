@@ -18,6 +18,36 @@ const candidatesLoading = ref(false), candidatesError = ref(''), memberSaving = 
 const memberFilter = ref(''), removeTarget = ref(null)
 const view = ref('all'), categoryFilter = ref(null), spaceSearch = ref('')
 const trash = ref([]), trashLoading = ref(false), trashError = ref(''), deleteName = ref('')
+const accessOptions = ref({departments:[],people:[]}), accessLoading = ref(false), accessError = ref('')
+const accessSearch = ref(''), accessDepartmentSearch = ref(''), selectedPeople = ref({})
+let accessRevision=0, accessTimer
+const accessModes = [{value:'all',label:'所有人',hint:'平台内所有已登录用户可阅读'}, {value:'departments',label:'指定部门',hint:'按组织归属自动开放阅读'}, {value:'members',label:'指定人员',hint:'仅负责人和指定人员可访问'}]
+const accessLabel = space=>space.kind==='personal'?'仅自己可见':({all:'所有人可见',departments:'指定部门可见',members:'指定人员可见'}[space.access_scope || 'members'])
+const accessDepartmentChoices = computed(()=>accessOptions.value.departments.filter(d=>(d.path || d.name).includes(accessDepartmentSearch.value.trim())))
+const selectedDepartments = computed(()=>(spaceForm.value.department_ids || []).map(id=>accessOptions.value.departments.find(d=>d.id===id) || spaceForm.value.access_departments?.find(d=>d.id===id) || {id,name:'部门 #'+id}))
+const selectedAccessPeople = computed(()=>(spaceForm.value.member_ids || []).map(id=>selectedPeople.value[id] || {id,display_name:'成员 #'+id}))
+async function loadAccessOptions() {
+  const revision=++accessRevision
+  accessLoading.value=true;accessError.value=''
+  try {
+    const data=await getTimed('/wiki/access-options?'+new URLSearchParams({q:accessSearch.value.trim()}))
+    if(disposed || revision!==accessRevision)return
+    if(!Array.isArray(data?.departments)||!Array.isArray(data?.people))throw new Error('权限选项加载失败，请重试')
+    accessOptions.value=data
+    for(const person of data.people)selectedPeople.value[person.id]=person
+  } catch(error){if(!disposed && revision===accessRevision)accessError.value=message(error,'加载开放范围')}
+  finally{if(!disposed && revision===accessRevision)accessLoading.value=false}
+}
+function resetAccessOptions(space={}) {
+  ++accessRevision;clearTimeout(accessTimer);accessSearch.value='';accessDepartmentSearch.value='';accessError.value=''
+  selectedPeople.value=Object.fromEntries((space.access_members || []).map(p=>[p.id,p]))
+  void loadAccessOptions()
+}
+function toggleAccess(field,id) {
+  const values=spaceForm.value[field] || []
+  spaceForm.value[field]=values.includes(id)?values.filter(value=>value!==id):[...values,id]
+}
+watch(accessSearch,()=>{++accessRevision;clearTimeout(accessTimer);accessTimer=setTimeout(loadAccessOptions,300)})
 const downloadedDraft = ref('')
 const bodyMode = ref('edit')
 const categories = computed(()=>[...new Set(spaces.value.map(space=>space.category || '').filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-CN')))
@@ -136,15 +166,15 @@ function newSpace() {
   returnToArticle.value=['create','edit'].includes(modal.value)
   // Editing cannot move a document, so do not replace the editing form.
   if(modal.value==='edit')return
-  formError.value='';spaceForm.value={key:'KB_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),name:'',description:'',category:categoryFilter.value || '',kind:'shared',owner_id:props.user.id}
-  modal.value='new-space'
+  formError.value='';spaceForm.value={key:'KB_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),name:'',description:'',category:categoryFilter.value || '',kind:'shared',owner_id:props.user.id,access_scope:'members',include_subdepartments:true,department_ids:[],member_ids:[]}
+  modal.value='new-space';resetAccessOptions()
 }
 async function settings(space) {
   if(!space.can_manage || saving.value || memberSaving.value)return
   returnToArticle.value=false;formError.value='';members.value=[];membersError.value=''
-  spaceForm.value={id:space.id,key:space.key,name:space.name,description:space.description,category:space.category || '',kind:space.kind,owner_id:space.owner_id}
+  spaceForm.value={id:space.id,key:space.key,name:space.name,description:space.description,category:space.category || '',kind:space.kind,owner_id:space.owner_id,access_scope:space.access_scope || 'members',include_subdepartments:space.include_subdepartments ?? true,department_ids:[...(space.department_ids || [])],member_ids:(space.access_members || []).map(p=>p.id),access_departments:space.access_departments || []}
   tab.value='general';modal.value='settings'
-  if(space.kind==='shared')void loadMembers()
+  if(space.kind==='shared'){void loadMembers();resetAccessOptions(space)}
 }
 function backdropClose() {
   if(!['detail','create','edit'].includes(modal.value))void close()
@@ -163,7 +193,7 @@ async function close() {
     if(editor.dirty.value)notice(editor.backedUp.value?'未同步内容已保留在此浏览器，重新编辑时会恢复草稿':'当前草稿已下载，请保管下载的文件')
     editor.stop()
   }
-  ++detailRevision;++memberRevision;++candidateRevision;clearTimeout(candidateTimer)
+  ++accessRevision;clearTimeout(accessTimer);++detailRevision;++memberRevision;++candidateRevision;clearTimeout(candidateTimer)
   if(modal.value==='new-space' && returnToArticle.value){modal.value='create';returnToArticle.value=false}
   else {modal.value='';returnToArticle.value=false;detail.value=null;versions.value=[];articleForm.value={}}
   formError.value='';detailError.value='';removeTarget.value=null
@@ -173,6 +203,8 @@ async function saveSpace() {
   if(!/^[A-Za-z0-9_-]{2,40}$/.test(spaceForm.value.key) || !spaceForm.value.name?.trim()) {
     formError.value='请填写空间名称及 2–40 位英文、数字、下划线或短横线标识';return
   }
+  if(spaceForm.value.access_scope==='departments' && !spaceForm.value.department_ids?.length){formError.value='请至少选择一个开放部门';return}
+  if(memberSaving.value || (modal.value==='settings' && membersLoading.value))return
   saving.value=true;formError.value=''
   const creating=modal.value==='new-space'
   try {
@@ -186,7 +218,7 @@ async function saveSpace() {
     } else {
       view.value='all';categoryFilter.value=null;spaceSearch.value='';scope.value=result.kind;selectedId.value=result.id;modal.value='';scheduleArticles()
     }
-    notice(creating?(result.kind==='personal'?'知识库已创建，仅自己可见':'知识库已创建，可在成员管理中邀请成员'):'空间设置已保存')
+    notice(creating?'知识库已创建，'+accessLabel(result):'空间设置已保存')
   } catch(error){if(!disposed){formError.value=message(error,'保存空间');if(unauthorized(error))void refreshAccess()}}
   finally{if(!disposed)saving.value=false}
 }
@@ -280,12 +312,12 @@ async function reloadEditor() {
     if(!disposed){formError.value=message(error,'读取最新版本');if(unauthorized(error))clearSensitive(true)}
   } finally {if(!disposed)saving.value=false}
 }
-async function loadMembers() {
+async function loadMembers(syncAccess=true) {
   const id=spaceForm.value.id,revision=++memberRevision
   membersLoading.value=true;membersError.value=''
   try {
     const result=await getTimed(`/wiki/spaces/${id}/members`)
-    if(!disposed && revision===memberRevision)members.value=result
+    if(!disposed && revision===memberRevision){members.value=result;if(syncAccess)spaceForm.value.member_ids=result.map(p=>p.user_id);for(const person of result)selectedPeople.value[person.user_id]={...person,id:person.user_id}}
   } catch(error){if(!disposed && revision===memberRevision){membersError.value=message(error,'成员加载');if(unauthorized(error))void refreshAccess()}}
   finally{if(!disposed && revision===memberRevision)membersLoading.value=false}
 }
@@ -309,13 +341,17 @@ async function mutateMember(action, person=null, role=null) {
   memberSaving.value=true;membersError.value=''
   const path=`/wiki/spaces/${spaceForm.value.id}/members`
   try {
+    let removed
+    const addedId=candidateId.value
     if(action==='add')await post(path,{user_id:candidateId.value,role:candidateRole.value})
-    else if(action==='remove')await del(`${path}/${person.user_id}`)
+    else if(action==='remove')removed=await del(`${path}/${person.user_id}`)
     else await patch(`${path}/${person.user_id}`,{role})
     if(disposed)return
+    if(action==='add' && !spaceForm.value.member_ids.includes(addedId))spaceForm.value.member_ids.push(addedId)
+    if(action==='remove')spaceForm.value.member_ids=spaceForm.value.member_ids.filter(id=>id!==person.user_id)
     removeTarget.value=null;candidateId.value=null;candidateRole.value='viewer'
-    notice(action==='remove'?'成员已移除，后续请求不再有访问权限':'成员权限已保存')
-    await Promise.all([loadMembers(),loadCandidates()])
+    notice(action==='remove'?(removed?.still_has_access?'直接授权已移除，该成员仍可通过开放范围阅读':'成员已移除，后续请求不再有访问权限'):'成员权限已保存')
+    await Promise.all([loadMembers(false),loadCandidates()])
   } catch(error){if(!disposed){membersError.value=message(error,'修改成员');if(unauthorized(error))void refreshAccess()}}
   finally{if(!disposed)memberSaving.value=false}
 }
@@ -338,7 +374,7 @@ async function refreshAccess() {
   void loadArticles()
 }
 onMounted(()=>{void loadSpaces();window.addEventListener('focus',refreshAccess)})
-onBeforeUnmount(()=>{disposed=true;editor.dispose();++spaceRevision;++listRevision;++detailRevision;++memberRevision;++candidateRevision;clearTimeout(timer);clearTimeout(candidateTimer);window.removeEventListener('focus',refreshAccess)})
+onBeforeUnmount(()=>{++accessRevision;clearTimeout(accessTimer);disposed=true;editor.dispose();++spaceRevision;++listRevision;++detailRevision;++memberRevision;++candidateRevision;clearTimeout(timer);clearTimeout(candidateTimer);window.removeEventListener('focus',refreshAccess)})
 </script>
 
 <template>
@@ -358,7 +394,7 @@ onBeforeUnmount(()=>{disposed=true;editor.dispose();++spaceRevision;++listRevisi
         <div v-if="!spacesLoading && !spacesError && !visibleSpaces.length" class="kb-hint">{{spaces.length?'没有匹配的知识库，请调整筛选条件。':'还没有知识库，创建一个开始积累吧。'}}</div>
       </aside>
       <section class="kb-main">
-        <div v-if="selected" class="kb-space-banner"><div class="kb-banner-content"><div class="kb-library-meta"><span class="kb-category-label"><FolderOpen :size="14"/>{{selected.category || '未分类'}}</span><span class="kb-access-label"><LockKeyhole v-if="selected.kind==='personal'" :size="13"/><Users v-else :size="13"/>{{selected.kind==='personal'?'仅自己可见':'指定成员可见'}}</span><span class="kb-role-label">{{selected.my_role==='owner'?'负责人':selected.my_role==='editor'?'编辑成员':'只读成员'}}</span></div><h2>{{selected.name}}</h2><p>{{selected.description || '在这里整理文档、分享经验与记录想法。'}}</p></div><button v-if="selected.can_manage" class="secondary-button kb-settings-button" @click="settings(selected)"><SlidersHorizontal :size="15"/>空间设置</button></div>
+        <div v-if="selected" class="kb-space-banner"><div class="kb-banner-content"><div class="kb-library-meta"><span class="kb-category-label"><FolderOpen :size="14"/>{{selected.category || '未分类'}}</span><span class="kb-access-label"><LockKeyhole v-if="selected.kind==='personal'" :size="13"/><Users v-else :size="13"/>{{accessLabel(selected)}}</span><span class="kb-role-label">{{selected.my_role==='owner'?'负责人':selected.my_role==='editor'?'编辑成员':'只读成员'}}</span></div><h2>{{selected.name}}</h2><p>{{selected.description || '在这里整理文档、分享经验与记录想法。'}}</p></div><button v-if="selected.can_manage" class="secondary-button kb-settings-button" @click="settings(selected)"><SlidersHorizontal :size="15"/>空间设置</button></div>
         <div v-else class="kb-space-banner"><div><h2>选择一个知识库</h2><p>从左侧目录打开，或新建知识库。分类和访问范围可以分别设置。</p></div></div>
         <div class="kb-toolbar"><label class="search-box"><Search :size="17"/><input v-model="search" aria-label="搜索知识库" placeholder="搜索标题或正文…"/></label><div class="kb-toolbar-right"><select v-model="status" aria-label="文档状态"><option value="all">全部状态</option><option value="draft">草稿</option><option value="published">已发布</option><option value="archived">已归档</option></select><span>{{articlesLoading?'查询中…':'共 '+articles.length+' 篇文档'}}</span><button v-if="canWrite" class="primary-button" @click="newArticle"><Plus :size="16"/>新建文档</button></div></div>
         <p v-if="selected && !canWrite" class="kb-readonly">你拥有此空间的只读权限，如需创建文档请联系负责人。</p>
@@ -378,7 +414,24 @@ onBeforeUnmount(()=>{disposed=true;editor.dispose();++spaceRevision;++listRevisi
         <div class="form-grid">
           <label class="field full"><span>知识库名称 *</span><input v-model.trim="spaceForm.name" required maxlength="120" placeholder="例如 客户交付资料、产品设计" :disabled="saving"/></label>
           <label class="field full"><span>知识库分类</span><input v-model.trim="spaceForm.category" list="kb-category-suggestions" maxlength="60" placeholder="输入新分类或选择已有分类" :disabled="saving"/><datalist id="kb-category-suggestions"><option v-for="category in categories" :key="category" :value="category"/></datalist><small class="field-help">分类可以按项目、产品或主题自定义，在空间设置中随时调整。</small></label>
-          <fieldset v-if="modal==='new-space'" class="kb-visibility field full"><legend>访问范围</legend><label class="active"><Users :size="19"/><span><strong>指定成员</strong><small>创建后邀请成员，默认只读；个人知识库已为你自动创建</small></span></label></fieldset>
+          <template v-if="spaceForm.kind==='shared'">
+            <fieldset class="kb-visibility kb-access-modes field full"><legend>开放范围</legend><label v-for="mode in accessModes" :key="mode.value" :class="{active:spaceForm.access_scope===mode.value}"><input type="radio" name="kb-access-scope" v-model="spaceForm.access_scope" :value="mode.value" :disabled="saving"/><span><strong>{{mode.label}}</strong><small>{{mode.hint}}</small></span></label></fieldset>
+            <div class="field full kb-access-note">开放范围授予阅读权限，包含文档及历史版本。编辑权限请在成员管理中单独设置。</div>
+            <div v-if="spaceForm.access_scope==='all'" class="field full kb-access-notice">保存后，平台内所有已登录用户均可阅读此空间，原有文档也会开放。</div>
+            <div v-if="spaceForm.access_scope==='departments'" class="field full kb-access-selector">
+              <strong>开放部门（可多选）</strong><input v-model="accessDepartmentSearch" aria-label="搜索开放部门" placeholder="搜索部门名称或层级" :disabled="saving"/>
+              <div class="kb-access-chips"><button v-for="department in selectedDepartments" :key="department.id" type="button" :disabled="saving" :aria-label="'移除开放部门'+department.name" @click="toggleAccess('department_ids',department.id)">{{department.path || department.name}}<X :size="12"/></button><small v-if="!selectedDepartments.length">尚未选择部门</small></div>
+              <div class="kb-access-options"><label v-for="department in accessDepartmentChoices" :key="department.id"><input type="checkbox" :checked="spaceForm.department_ids.includes(department.id)" :disabled="saving" @change="toggleAccess('department_ids',department.id)"/><span>{{department.path || department.name}}</span></label><p v-if="!accessLoading&&!accessDepartmentChoices.length">没有匹配的部门</p></div>
+              <label class="kb-access-subdepartments"><input type="checkbox" v-model="spaceForm.include_subdepartments" :disabled="saving"/>包含下级部门</label><small>成员加入任意所选部门即可阅读；离开后重新校验权限。</small>
+            </div>
+            <div class="field full kb-access-selector">
+              <strong>{{spaceForm.access_scope==='members'?'指定人员（可多选）':'额外授权人员（可选）'}}</strong><small>已授权人员在所有范围下保留权限；新选人员默认为只读。</small>
+              <div class="kb-access-chips"><button v-for="person in selectedAccessPeople" :key="person.id" type="button" :disabled="saving||membersLoading" :aria-label="'移除授权人员'+person.display_name" @click="toggleAccess('member_ids',person.id)">{{person.display_name}}{{person.role==='editor'?' · 编辑':''}}<X :size="12"/></button><small v-if="!selectedAccessPeople.length">暂未指定其他人员，仅负责人保留管理权限</small></div>
+              <input v-model="accessSearch" aria-label="搜索开放人员" placeholder="搜索姓名、用户名或部门" :disabled="saving"/>
+              <div class="kb-access-options"><label v-for="person in accessOptions.people" :key="person.id"><input type="checkbox" :checked="spaceForm.member_ids.includes(person.id)" :disabled="saving||membersLoading" @change="toggleAccess('member_ids',person.id)"/><span>{{person.display_name}}（{{person.username}}）<small>{{person.department || '未分配部门'}}</small></span></label><p v-if="!accessLoading&&!accessOptions.people.length">没有匹配的人员</p></div><small>最多显示 50 位候选人员，可搜索查找；已选人员始终保留在上方。</small>
+            </div>
+            <p v-if="accessLoading" class="field full kb-hint" role="status">正在加载权限选项…</p><p v-if="accessError" class="field full kb-error" role="alert">{{accessError}}<button type="button" class="text-button" @click="loadAccessOptions">重试</button></p>
+          </template>
           <label class="field full"><span>空间说明</span><textarea v-model.trim="spaceForm.description" rows="3" maxlength="300" :disabled="saving"/></label>
           <label v-if="modal==='settings'&&settingSpace?.kind==='shared'" class="field full"><span>空间负责人</span><select v-model.number="spaceForm.owner_id" :disabled="saving||membersLoading||Boolean(membersError)"><option :value="settingSpace.owner_id">{{settingSpace.owner_name}}（当前负责人）</option><option v-for="person in ownerChoices" :key="person.user_id" :value="person.user_id">{{person.display_name}}（{{person.username}}）</option></select><small class="field-help">转让后，你将保留编辑成员权限。</small><small v-if="membersError" class="kb-error">{{membersError}}<button type="button" class="text-button" @click="loadMembers">重试</button></small></label>
         </div>
@@ -394,7 +447,7 @@ onBeforeUnmount(()=>{disposed=true;editor.dispose();++spaceRevision;++listRevisi
         <p v-if="membersLoading" role="status" class="kb-hint">正在加载空间成员…</p>
         <div v-for="person in filteredMembers" :key="person.user_id" class="kb-member-row"><div><strong>{{person.display_name}}<span v-if="!person.active" class="kb-disabled">已停用</span></strong><small>{{person.username}} · {{person.department}}</small></div><select :value="person.role" :aria-label="person.display_name+'的权限'" :disabled="memberSaving" @change="mutateMember('role',person,$event.target.value)"><option value="viewer">只读</option><option value="editor">编辑</option></select><button class="text-button kb-danger" :disabled="memberSaving" @click="removeTarget=person">移除</button></div>
         <p v-if="!membersLoading&&!filteredMembers.length" class="kb-hint">{{memberFilter?'没有匹配的成员':'暂未添加其他成员。'}}</p>
-        <div v-if="removeTarget" class="kb-remove-confirm" role="alert"><span>移除 {{removeTarget.display_name}} 后，该成员将失去此空间的访问权限。已有文档保留。</span><button class="secondary-button" :disabled="memberSaving" @click="removeTarget=null">取消</button><button class="primary-button" :disabled="memberSaving" @click="mutateMember('remove',removeTarget)">确认移除</button></div>
+        <div v-if="removeTarget" class="kb-remove-confirm" role="alert"><span>将移除 {{removeTarget.display_name}} 的直接授权；若仍属于全员或部门开放范围，该成员仍可阅读。已有文档保留。</span><button class="secondary-button" :disabled="memberSaving" @click="removeTarget=null">取消</button><button class="primary-button" :disabled="memberSaving" @click="mutateMember('remove',removeTarget)">确认移除</button></div>
       </div>
       <form v-else-if="modal==='create'||modal==='edit'" class="modal-body form-body" @submit.prevent="saveArticle">
         <div class="kb-save-state" :class="{warning:editor.error.value||editor.fieldError.value||editor.localError.value}" role="status" aria-live="polite"><span class="kb-save-indicator" :class="{syncing:editor.syncing.value,warning:editor.error.value||editor.fieldError.value||editor.localError.value}"></span><div><strong>{{editor.status.value}}</strong><small>{{modal==='create'?'新文档先保留本地草稿，点击“保存文档”后创建。':'停止输入约 1 秒后自动保存内容，不增加版本；点击“保存文档”生成一个新版本。'}}<template v-if="editor.lastSaved.value"> · {{new Date(editor.lastSaved.value).toLocaleTimeString('zh-CN')}}</template></small></div><button v-if="editor.error.value&&!editor.conflict.value&&modal==='edit'" type="button" class="text-button" :disabled="saving||editor.syncing.value" @click="editor.retry">重试同步</button><button v-if="editor.dirty.value" type="button" class="text-button" @click="downloadDraft">下载草稿</button></div>

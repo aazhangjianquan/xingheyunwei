@@ -27,7 +27,8 @@ with SessionLocal() as db, httpx.Client(base_url='http://frontend', timeout=15) 
     paths = re.findall(r'<script[^>]+src="([^"]+)"', html)
     assert paths
     javascript = '\n'.join(client.get(path).text for path in paths if path.startswith('/assets/'))
-    for marker in ('到期前 1 个自然月', '开启资源结束飞书提醒', '关闭后，本单据所有接收人', '补录 / 修改历史运维责任人'):
+    for marker in ('到期前 1 个自然月', '开启资源结束飞书提醒', '关闭后，本单据所有接收人', '补录 / 修改历史运维责任人',
+                   '提醒开关最近修改', '当前节点投递状态', '无后续提醒节点'):
         assert marker in javascript, '部署资源缺少功能：' + marker
     report['checks'].append('Nginx 页面与构建资源已包含 License、资源提醒开关及历史人员补录')
     admin = next(p for p in db.scalars(select(User).where(User.active.is_(True))) if has_role(p, 'admin'))
@@ -41,20 +42,24 @@ with SessionLocal() as db, httpx.Client(base_url='http://frontend', timeout=15) 
             response = client.get(f'/api/{section}/{item.id}', headers=headers)
             response.raise_for_status()
             state = response.json()['reminder']
-            assert {'enabled', 'can_edit', 'revision', 'recipients', 'rules', 'records'} <= set(state)
+            assert {'enabled', 'can_edit', 'revision', 'recipients', 'rules', 'records', 'next_rule', 'current_delivery'} <= set(state)
             owner = db.get(User, item.applicant_id)
             if owner.active:
                 owner_headers = {'Authorization': 'Bearer ' + make_token(owner.id)}
                 state_response = client.get(f'/api/{"licenses" if kind == "license" else "resource"}/{item.id}/reminder', headers=owner_headers)
                 state_response.raise_for_status()
                 assert state_response.json()['can_edit'] is True
+                repeated = client.get(f'/api/{"licenses" if kind == "license" else "resource"}/{item.id}/reminder', headers=owner_headers)
+                repeated.raise_for_status()
+                for field in ('revision', 'updated_at', 'updated_by_name', 'next_at', 'next_rule'):
+                    assert repeated.json()[field] == state_response.json()[field], '重复读取改变提醒状态：' + field
         disabled = client.get('/api/' + section + '?reminder=disabled', headers=headers)
         disabled.raise_for_status()
         assert all(row['reminder_enabled'] is False for row in disabled.json()['items'])
         report['business'][kind] = {'visible_total': listing.json()['total'],
             'active_plans': db.scalar(select(func.count()).select_from(ReminderPlan).where(
                 ReminderPlan.object_type == kind, ReminderPlan.state == 'active'))}
-    report['checks'].append('两类列表、详情、开关读取、申请人权限和提醒筛选接口通过')
+    report['checks'].append('两类列表、详情、开关读取、申请人权限和提醒筛选接口通过；重复读取保持修改时间和下次节点不变')
     duplicates = db.execute(select(ReminderDelivery.plan_id, ReminderDelivery.recipient_id, func.count())
         .group_by(ReminderDelivery.plan_id, ReminderDelivery.recipient_id).having(func.count() > 1)).all()
     assert not duplicates

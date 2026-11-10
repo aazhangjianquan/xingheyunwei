@@ -16,7 +16,7 @@ from app import audit, main
 from app.database import Base, get_db
 from app.migrations import upgrade
 from app.models import (AuditLog, DeliveryCredential, Project, ProjectMember, ResourceRequest, User, UserRole, WikiArticle,
-                        WorkflowTemplate, WorkflowVersion)
+                        WorkflowTemplate, WorkflowVersion, DepartmentManager)
 from app.security import encrypt_secret, make_token
 
 from app.rate_limit import RateDecision
@@ -45,8 +45,11 @@ class BusinessAuditTests(unittest.TestCase):
                 db.add(person); db.flush(); self.ids[username] = person.id
             project = Project(name='业务平台100%_', department='研发部', created_by=self.ids['admin'])
             db.add(project); db.flush(); self.project_id=project.id
-            for name, role in [('owner','applicant'), ('manager','project_owner'), ('manager','project_manager')]:
+            for name, role in [('owner','applicant'), ('final','operator'), ('manager','project_owner'), ('manager','project_manager')]:
                 db.add(ProjectMember(project_id=project.id, user_id=self.ids[name], role=role))
+            from app import organization as org
+            org.seed_organization(db)
+            db.add(DepartmentManager(department_id=project.department_id, user_id=self.ids['reviewer']))
             for kind in ['resource', 'change', 'delivery', 'license']:
                 definition = {'steps':[
                     {'id':'review','name':'部门审核','type':'approval','mode':'all','assignee':{'source':'fixed','user_ids':[self.ids['reviewer']]}},
@@ -114,7 +117,7 @@ class BusinessAuditTests(unittest.TestCase):
                 owner_id=item['applicant_id'] if kind in {'resource','license'} else item['owner_id']
                 self.assertEqual(owner_id,self.ids['admin'])
                 self.assertEqual((item['owner_department'],item['approval_department']),('平台管理','研发部'))
-                self.assertEqual(item['approval_department_source'],'project')
+                self.assertEqual(item['approval_department_source'],'selected_membership')
                 task=next(a for a in item['approvals'] if a['action']=='pending')
                 self.assertEqual(task['assignee_id'],self.ids['reviewer'])
                 self.assertEqual(self.logs(target_type=kind,action='create')['items'][0]['actor_username'],'admin')
@@ -131,7 +134,7 @@ class BusinessAuditTests(unittest.TestCase):
             self.assertEqual(row['record_kind'],'business')
             changes=self.details(row)['changes']
             self.assertTrue(any(c['field']=='project' and '业务平台100%_' in c['after'] for c in changes))
-            self.assertTrue(any(c['field']=='stage' and c['after']=='部门审核' for c in changes))
+            self.assertTrue(any(c['field']=='stage' and c['after']=='部门负责人审批' for c in changes))
         self.assertEqual(self.logs()['total'],4)
         self.assertGreater(self.logs(record_kind='request')['total'],4)
 
@@ -217,7 +220,7 @@ class BusinessAuditTests(unittest.TestCase):
     def test_member_updates_and_settings_secrets_are_markers_only(self):
         password='Secure@Password2030'
         response=self.client.post('/api/users',headers=self.headers['admin'],json={
-            'username':'newmember','display_name':'新成员','department':'研发部','roles':['applicant'],'password':password})
+            'username':'newmember','display_name':'新成员','department_id':self.client.post('/api/departments',headers=self.headers['admin'],json={'name':'账号测试部'}).json()['id'],'roles':['applicant'],'password':password})
         self.assertEqual(response.status_code,200,response.text)
         uid=response.json()['id']
         self.client.patch(f'/api/users/{uid}',headers=self.headers['admin'],json={'active':False,'password':'NewSecure@2030','roles':['applicant','license_manager']})
@@ -260,6 +263,9 @@ class BusinessAuditTests(unittest.TestCase):
 
     def test_transfer_records_actual_old_and_new_handler(self):
         item=self.create('resource')
+        with self.sessions() as db:
+            reviewer=db.get(User,self.ids['reviewer'])
+            db.add(DepartmentManager(department_id=reviewer.department_id,user_id=self.ids['replacement']));db.commit()
         task=next(a for a in self.read('resource',item)['approvals'] if a['action']=='pending')
         response=self.client.post(f'/api/admin/tasks/{task["id"]}/reassign',headers=self.headers['admin'],
             json={'assignee_id':self.ids['replacement'],'reason':'审批人休假'})

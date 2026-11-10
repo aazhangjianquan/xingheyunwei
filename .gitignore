@@ -16,6 +16,7 @@ reports/profile-backups/
 reports/redis-backups/
 reports/services-backups/
 reports/reminder-backups/
+reports/organization-backups/
 k8s-deploy/.private/
 k8s-deploy/rendered*.yaml
 

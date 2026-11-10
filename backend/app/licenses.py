@@ -17,10 +17,11 @@ from .roles import has_role
 from .security import decrypt_secret, encrypt_secret
 from .license_tool import generate_key
 from . import audit as operation_audit
-from . import reminders
+from . import reminders, organization as org
 
 
 class LicenseIn(BaseModel):
+    application_department_id: int | None = Field(default=None, gt=0)
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     project_id: int = Field(gt=0)
     project_name: str = Field(default='', max_length=150)
@@ -35,6 +36,7 @@ class LicenseIn(BaseModel):
 
 
 class LegacyReviewIn(BaseModel):
+    application_department_id: int | None = Field(default=None, gt=0)
     model_config = ConfigDict(extra='forbid')
     project_id: int | None = Field(default=None, gt=0)
 
@@ -77,7 +79,7 @@ def can_view_key(item, user):
 
 
 def license_out(item, names, user, include_key=False):
-    fields = ('id', 'code', 'applicant_id', 'project_id', 'project_name', 'customer', 'product',
+    fields = ('id', 'code', 'applicant_id', 'project_id', 'application_department_id', 'project_name', 'customer', 'product',
               'tenant_id', 'expire_time', 'account_number', 'agent_number', 'purpose', 'status',
               'stage', 'final_approver_id', 'generated_by', 'generated_at', 'created_at', 'updated_at',
               'reminder_enabled', 'reminder_revision')
@@ -103,7 +105,11 @@ def names_for(db, rows):
 def license_detail_out(db, item, user):
     from .main import detail
     history = detail(db, 'license', item, user=user)
-    return {**history, **license_out(item, names_for(db, [item]), user, include_key=True)}
+    result = {**history, **license_out(item, names_for(db, [item]), user, include_key=True)}
+    if item.stage == 'awaiting_workflow' and (item.applicant_id == user.id or can_manage(user)):
+        owner = db.get(User, item.applicant_id)
+        result['application_departments'] = org.organization_info(owner)['departments']
+    return result
 
 
 def finalize_license(item, user):
@@ -177,6 +183,7 @@ def register_routes(app, current_user):
 
     @app.post('/api/licenses', status_code=201)
     def apply_license(data: LicenseIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user=Depends(current_user)):
+        org.write_lock(db, user, track_pending=False)
         from .main import start_workflow
         check_expiration(data)
         project = application_project(db, data.project_id, user)
@@ -205,6 +212,7 @@ def register_routes(app, current_user):
 
     @app.post('/api/licenses/{item_id}/submit-review')
     def submit_legacy(item_id: int, data: LegacyReviewIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user=Depends(current_user)):
+        org.write_lock(db, user, track_pending=False)
         from .main import start_workflow
         item = db.scalar(select(LicenseRequest).where(LicenseRequest.id == item_id, LicenseRequest.deleted_at.is_(None)).with_for_update())
         if not item or (item.applicant_id != user.id and not can_manage(user)):
@@ -219,11 +227,13 @@ def register_routes(app, current_user):
             raise HTTPException(409, '申请者账号已停用，请先联系管理员处理')
         project = application_project(db, data.project_id or item.project_id, owner)
         item.project_id, item.project_name = project.id, project.name
+        item.application_department_id = data.application_department_id
         start_workflow(db, tasks, 'license', item, owner, operation='submit_review', before=before, actor=user)
         return license_detail_out(db, item, user)
 
     @app.post('/api/licenses/{item_id}/resubmit')
     def resubmit_license(item_id: int, data: LicenseIn, tasks: BackgroundTasks, db: Session = Depends(get_db), user=Depends(current_user)):
+        org.write_lock(db, user, track_pending=False)
         from .main import start_workflow
         item = db.scalar(select(LicenseRequest).where(LicenseRequest.id == item_id, LicenseRequest.deleted_at.is_(None)).with_for_update())
         if not item or item.applicant_id != user.id:

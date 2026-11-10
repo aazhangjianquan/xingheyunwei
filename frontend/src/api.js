@@ -1,5 +1,5 @@
 const API = '/api'
-const PUBLIC_AUTH_PATHS = new Set(['/login', '/auth/options', '/auth/ticket', '/auth/feishu/start'])
+const PUBLIC_AUTH_PATHS = new Set(['/login', '/auth/options', '/auth/ticket', '/auth/feishu/start', '/auth/feishu/task/start'])
 let rateLimitToken, rateLimitUntil = 0
 
 export class ApiError extends Error {

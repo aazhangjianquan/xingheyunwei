@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Copy, FileKey2, KeyRound, Plus, RefreshCw, Search, X } from 'lucide-vue-next'
 import { get, post, del } from './api'
 import ExpiryReminder from './ExpiryReminder.vue'
+import ApplicationDepartment from './ApplicationDepartment.vue'
 
 const props = defineProps({ user: { type: Object, required: true } })
 const emit = defineEmits(['notice'])
@@ -11,7 +12,7 @@ const page = ref(1), pageSize = ref(10), total = ref(0), totalPages = ref(1)
 const search = ref(''), status = ref('all'), reminderFilter = ref('all')
 const loading = ref(false), saving = ref(false), listError = ref(''), modalError = ref('')
 const modal = ref(''), detail = ref(null), form = ref({}), deleteConfirm = ref(false)
-const projects = ref([]), projectsLoading = ref(false), projectsError = ref(''), legacyProjectId = ref(null)
+const projects = ref([]), projectsLoading = ref(false), projectsError = ref(''), legacyProjectId = ref(null), legacyDepartmentId = ref(null)
 const canSubmitLegacy = computed(() => detail.value?.stage === 'awaiting_workflow' && (detail.value.applicant_id === props.user.id || props.user.roles.some(r => ['admin','license_manager'].includes(r))))
 const selectedProject = computed(() => projects.value.find(p => p.id === form.value.project_id))
 const statusLabels = {pending:'待审批',in_progress:'审批中',generated:'已生成',rejected:'已驳回'}
@@ -88,14 +89,14 @@ async function loadProjects(path = '/projects') {
 async function newApplication() {
   closeModal()
   resubmitId.value = null
-  form.value = { project_id: null, customer: '', product: '', tenant_id: 1, expire_at: '', account_number: -1, agent_number: -1, purpose: '', reminder_enabled: true }
+  form.value = { project_id: null, application_department_id: null, customer: '', product: '', tenant_id: 1, expire_at: '', account_number: -1, agent_number: -1, purpose: '', reminder_enabled: true }
   modal.value = 'apply'
   await loadProjects()
 }
 async function openDetail(id, push = true) {
   const current = ++detailRevision
   ++projectRevision
-  legacyProjectId.value = null; projects.value = []; projectsError.value = ''; projectsLoading.value = false
+  legacyProjectId.value = null; legacyDepartmentId.value = null; projects.value = []; projectsError.value = ''; projectsLoading.value = false
   modal.value = 'detail'; detail.value = null; modalError.value = ''; actionComment.value = ''
   if (push) window.history.pushState({}, '', `/licenses/${id}`)
   try {
@@ -150,7 +151,7 @@ async function submitReview() {
   modalError.value = ''
   try {
     if (projectsLoading.value || projectsError.value || !projects.value.some(p => p.id === legacyProjectId.value)) throw new Error('请选择申请者有权限的启用项目')
-    const result = await post(`/licenses/${detail.value.id}/submit-review`, {project_id: legacyProjectId.value})
+    const result = await post(`/licenses/${detail.value.id}/submit-review`, {project_id: legacyProjectId.value, application_department_id: legacyDepartmentId.value})
     if (disposed) return
     detail.value = result
     await load()
@@ -161,7 +162,7 @@ async function submitReview() {
 async function editRejected() {
   const item = detail.value
   ++detailRevision
-  form.value = Object.fromEntries(['project_id','customer','product','tenant_id','account_number','agent_number','purpose','reminder_enabled'].map(k => [k,item[k]]))
+  form.value = Object.fromEntries(['project_id','application_department_id','customer','product','tenant_id','account_number','agent_number','purpose','reminder_enabled'].map(k => [k,item[k]]))
   form.value.expire_at = new Date(item.expire_time + 8*3600000).toISOString().slice(0,16)
   resubmitId.value = item.id
   modal.value = 'apply'
@@ -248,7 +249,8 @@ onBeforeUnmount(() => {
           <p v-if="modalError" class="license-error" role="alert">{{ modalError }}</p>
           <form v-if="modal === 'apply'" @submit.prevent="submitApplication">
             <div class="form-grid">
-              <label class="field full"><span>关联项目 <b>*</b></span><select v-model.number="form.project_id" required :disabled="saving || projectsLoading || Boolean(projectsError)"><option :value="null" disabled>选择项目管理中的项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{p.name}} · {{p.department}}</option></select><small class="field-help">与资源申请使用相同的项目目录，仅可选择有权限的启用项目；审批可按项目岗位匹配处理人。</small><small v-if="isAdmin" class="field-help">系统管理员可申请全部启用项目；部门岗位及部门条件按关联项目所属部门匹配。</small><small v-if="projectsLoading" class="field-help" role="status">正在加载项目…</small><small v-else-if="projectsError" class="license-error" role="alert">项目加载失败：{{projectsError}} <button type="button" class="text-button" @click="loadProjects()">重试</button></small><small v-else-if="!projects.length" class="field-help">暂无可选项目，请联系管理员在「项目管理」创建项目并分配岗位。</small><small v-else-if="form.project_id && !selectedProject" class="field-help">原关联项目已停用或已无权限，请重新选择。</small></label>
+              <ApplicationDepartment v-model="form.application_department_id" :user="user" />
+              <label class="field full"><span>关联项目 <b>*</b></span><select v-model.number="form.project_id" required :disabled="saving || projectsLoading || Boolean(projectsError)"><option :value="null" disabled>选择项目管理中的项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{p.name}} · {{p.department}}</option></select><small class="field-help">与资源申请使用相同的项目目录，仅可选择有权限的启用项目；审批可按项目岗位匹配处理人。</small><small v-if="isAdmin" class="field-help">系统管理员可申请全部启用项目；审批按本次选择的申请部门匹配。</small><small v-if="projectsLoading" class="field-help" role="status">正在加载项目…</small><small v-else-if="projectsError" class="license-error" role="alert">项目加载失败：{{projectsError}} <button type="button" class="text-button" @click="loadProjects()">重试</button></small><small v-else-if="!projects.length" class="field-help">暂无可选项目，请联系管理员在「项目管理」创建项目并分配岗位。</small><small v-else-if="form.project_id && !selectedProject" class="field-help">原关联项目已停用或已无权限，请重新选择。</small></label>
               <label class="field"><span>客户名称 <b>*</b></span><input v-model.trim="form.customer" required maxlength="180" placeholder="请输入客户或业务单位" /></label>
               <label class="field"><span>授权产品 <b>*</b></span><input v-model.trim="form.product" required maxlength="150" placeholder="请输入产品名称" /></label>
               <label class="field"><span>租户 ID <b>*</b></span><input v-model.number="form.tenant_id" type="number" required min="1" max="2147483647" step="1" /></label>
@@ -262,7 +264,7 @@ onBeforeUnmount(() => {
           </form>
           <template v-else-if="detail">
             <div class="detail-topline"><span class="code-label">{{ detail.code }}</span><span class="status-tag" :class="{generated:'green',rejected:'red',in_progress:'blue'}[detail.status] || 'amber'">{{ statusLabels[detail.status] }}</span><button class="text-button license-refresh" :disabled="saving" @click="openDetail(detail.id, false)"><RefreshCw :size="14" /> 刷新详情</button></div>
-            <div class="detail-section"><h3>申请信息</h3><div class="detail-grid"><div><span>关联项目</span><strong>{{ detail.project_name }}</strong><small v-if="!detail.project_id" class="field-help">历史申请 · 尚未关联项目</small></div><div><span>客户名称</span><strong>{{ detail.customer }}</strong></div><div><span>授权产品</span><strong>{{ detail.product }}</strong></div><div><span>申请人</span><strong>{{ detail.applicant_name }}</strong></div><div v-if="detail.approval_department"><span>审批归属部门</span><strong>{{detail.approval_department}}</strong><small v-if="detail.approval_department_source==='project'" class="field-help">管理员申请 · 按项目所属部门匹配审批</small></div><div><span>租户 ID</span><strong>{{ detail.tenant_id }}</strong></div><div><span>到期时间（北京时间）</span><strong>{{ dateTime(detail.expire_time) }}</strong></div><div><span>账号数</span><strong>{{ limit(detail.account_number) }}</strong></div><div><span>Agent 数</span><strong>{{ limit(detail.agent_number) }}</strong></div><div class="full"><span>申请用途</span><strong>{{ detail.purpose }}</strong></div><div><span>申请时间（北京时间）</span><strong>{{ dateTime(detail.created_at) }}</strong></div></div></div>
+            <div class="detail-section"><h3>申请信息</h3><div class="detail-grid"><div><span>关联项目</span><strong>{{ detail.project_name }}</strong><small v-if="!detail.project_id" class="field-help">历史申请 · 尚未关联项目</small></div><div><span>客户名称</span><strong>{{ detail.customer }}</strong></div><div><span>授权产品</span><strong>{{ detail.product }}</strong></div><div><span>申请人</span><strong>{{ detail.applicant_name }}</strong></div><div v-if="detail.approval_department"><span>审批归属部门</span><strong>{{detail.approval_department}}</strong><small v-if="detail.approval_department_source==='project'" class="field-help">历史流程 · 按项目所属部门匹配审批</small></div><div><span>租户 ID</span><strong>{{ detail.tenant_id }}</strong></div><div><span>到期时间（北京时间）</span><strong>{{ dateTime(detail.expire_time) }}</strong></div><div><span>账号数</span><strong>{{ limit(detail.account_number) }}</strong></div><div><span>Agent 数</span><strong>{{ limit(detail.agent_number) }}</strong></div><div class="full"><span>申请用途</span><strong>{{ detail.purpose }}</strong></div><div><span>申请时间（北京时间）</span><strong>{{ dateTime(detail.created_at) }}</strong></div></div></div>
             <ExpiryReminder :key="detail.id" kind="license" :item-id="detail.id" :value="detail.reminder" @updated="value => { detail.reminder = value; detail.reminder_enabled = value.enabled; load() }" />
             <div class="detail-section"><div class="detail-section-heading"><h3>License Key</h3><button v-if="detail.license_key" class="secondary-button" @click="copyKey"><Copy :size="15" /> 复制完整 Key</button></div>
               <template v-if="detail.license_key"><p class="field-help">完整授权结果包含 body 与 key，可复制用于产品授权。</p><textarea class="license-key" :value="detail.license_key" readonly rows="9" aria-label="生成的 License Key" spellcheck="false" /><p class="field-help">最终审批人：{{ detail.final_approver_name }} · 生成时间：{{ dateTime(detail.generated_at) }}（北京时间）</p></template>
@@ -274,7 +276,7 @@ onBeforeUnmount(() => {
               <article v-for="round in detail.rounds" :key="round.id" class="license-round"><div class="license-round-head"><strong>第 {{round.round}} 轮</strong><span>{{round.version_id ? '流程版本 #'+round.version_id : '历史流程'}} · {{statusLabels[round.status] || (round.status==='completed'?'已完成':round.status)}}</span></div><div v-for="node in round.nodes" :key="node.id" class="license-approval-node" :class="node.status"><div class="license-node-dot"></div><div class="license-node-content"><strong>{{node.name}}</strong><small>{{ {waiting:'待流转',pending:'待审批',completed:'已通过',rejected:'已驳回',closed:'已关闭'}[node.status] }} · {{node.node_type==='license_approval'?'最终审批 · ':''}}{{node.mode==='all'?'全部同意（会签）':node.mode==='any'?'任意一人同意（或签）':`任意 ${node.config?.required_count || 0} 人同意`}}</small><span v-if="!node.tasks.length">{{node.config.assignees?.map(a=>a.name).join('、')}}</span><div v-for="task in node.tasks" :key="task.id" class="license-task"><span>{{task.assignee_name}} · {{ {pending:'待处理',approve:'已通过',reject:'已驳回',closed:'已关闭'}[task.action] }}</span><p v-if="task.comment">{{task.comment}}</p><small v-if="task.acted_at">{{dateTime(task.acted_at)}}</small><p v-if="task.action==='pending' && !task.eligible" class="license-error">处理人账号或角色已变化，请管理员转交。</p><div v-if="isAdmin && task.action==='pending'" class="license-transfer"><select v-model.number="task.new_assignee_id" aria-label="转交审批人"><option :value="undefined" disabled>选择新审批人</option><option v-for="p in people.filter(p=>p.active && p.id!==detail.applicant_id)" :key="p.id" :value="p.id">{{p.display_name}}</option></select><input v-model="task.transfer_reason" placeholder="转交原因" aria-label="转交原因" /><button class="text-button" :disabled="saving || !task.new_assignee_id || !task.transfer_reason" @click="transferTask(task)">转交</button></div></div></div></div></article>
               <p v-for="transfer in detail.transfers" :key="transfer.id" class="field-help">任务 #{{transfer.task_id}} 已转交 · {{transfer.reason}} · {{dateTime(transfer.created_at)}}</p>
             </div>
-            <div v-if="canSubmitLegacy" class="action-box"><h3>关联项目并补充审批</h3><p>选择申请者有权限的启用项目。系统管理员作为申请人时，部门岗位按项目所属部门匹配。完成审批后才可查看密钥。</p><label class="field"><span>关联项目 <b>*</b></span><select v-model.number="legacyProjectId" :disabled="saving || projectsLoading"><option :value="null" disabled>请选择关联项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{p.name}} · {{p.department}}</option></select></label><p v-if="projectsLoading" class="field-help" role="status">正在加载申请者可用的项目…</p><p v-else-if="projectsError" class="license-error" role="alert">{{projectsError}} <button type="button" class="text-button" @click="loadProjects(`/licenses/${detail.id}/projects`)">重试</button></p><p v-else-if="!projects.length" class="field-help">申请者暂无可用项目，请先在项目管理中分配岗位。</p><button class="primary-button" :disabled="saving || projectsLoading || Boolean(projectsError) || !legacyProjectId" @click="submitReview">提交审批</button></div>
+            <div v-if="canSubmitLegacy" class="action-box"><h3>关联项目并补充审批</h3><ApplicationDepartment v-model="legacyDepartmentId" :user="{departments:detail.application_departments || []}" /><p>选择申请者有权限的启用项目。本次申请部门只能选择申请者已加入的部门。完成审批后才可查看密钥。</p><label class="field"><span>关联项目 <b>*</b></span><select v-model.number="legacyProjectId" :disabled="saving || projectsLoading"><option :value="null" disabled>请选择关联项目</option><option v-for="p in projects" :key="p.id" :value="p.id">{{p.name}} · {{p.department}}</option></select></label><p v-if="projectsLoading" class="field-help" role="status">正在加载申请者可用的项目…</p><p v-else-if="projectsError" class="license-error" role="alert">{{projectsError}} <button type="button" class="text-button" @click="loadProjects(`/licenses/${detail.id}/projects`)">重试</button></p><p v-else-if="!projects.length" class="field-help">申请者暂无可用项目，请先在项目管理中分配岗位。</p><button class="primary-button" :disabled="saving || projectsLoading || Boolean(projectsError) || !legacyProjectId" @click="submitReview">提交审批</button></div>
             <div v-if="detail.status==='rejected' && detail.applicant_id===user.id" class="action-box"><h3>申请已驳回</h3><p>修改授权参数后，按最新流程重新审批。</p><button class="primary-button" :disabled="saving" @click="editRejected">修改并重新提交</button></div>
             <form v-if="myTask" class="action-box license-approve-form" @submit.prevent="submitApproval('approve')"><h3>{{detail.current_node?.name}}</h3><p>{{detail.current_node?.node_type==='license_approval'?'通过后自动生成密钥，仅你与申请者可查看。':'请核对申请参数，再提交审批意见。'}}</p><label class="field"><span>审批意见</span><textarea v-model="actionComment" rows="3" placeholder="填写审核意见或驳回原因" /></label><div class="action-buttons"><button type="button" class="danger-button" :disabled="saving" @click="submitApproval('reject')">驳回修改</button><button class="primary-button" :disabled="saving">{{saving?'处理中…':detail.current_node?.node_type==='license_approval'?'通过并生成密钥':'同意'}}</button></div></form>
             <div v-if="detail.can_delete" class="record-danger-zone"><div><strong>删除这张 License 申请</strong><p>删除后列表和详情将隐藏，审批历史和操作日志仍会保留。</p></div><template v-if="deleteConfirm"><span class="record-danger-question">确认删除 {{detail.code}}？</span><button class="secondary-button" :disabled="saving" @click="deleteConfirm=false">取消</button><button class="danger-button" :disabled="saving" @click="deleteLicense">{{saving?'删除中…':'确认删除'}}</button></template><button v-else class="danger-button" :disabled="saving" @click="requestDelete">删除申请</button></div>

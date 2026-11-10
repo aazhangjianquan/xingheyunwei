@@ -47,6 +47,10 @@ def run_once(sessions=SessionLocal, *, preview=False, stamp=None):
                     counts['errors'] += 1
                     logger.exception('提醒计划处理失败 kind=%s id=%s', kind, item_id)
             cursor = ids[-1]
+    from .personal_reminders import scan_due
+    personal = scan_due(sessions, stamp, preview=preview)
+    for key in ('scanned', 'notifications', 'errors'):
+        counts[key] += personal[key]
     return counts
 
 

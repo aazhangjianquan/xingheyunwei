@@ -7,6 +7,7 @@ export function readBootstrapSettings(doc = document) {
     return {
       site_name: value.site_name,
       feishu_login_enabled: value.feishu_login_enabled === true,
+      feishu_task_login_enabled: value.feishu_task_login_enabled === true,
       local_login_enabled: value.local_login_enabled !== false,
     }
   } catch { return null }

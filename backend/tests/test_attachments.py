@@ -65,7 +65,7 @@ class AttachmentFixture(unittest.TestCase):
                 db.add(user); db.flush(); self.ids[name] = user.id
             project = Project(name='交付关联项目', department='研发', created_by=self.ids['admin'])
             db.add(project); db.flush()
-            for name in ['owner','colleague']:
+            for name in ['owner','colleague','ops']:
                 db.add(ProjectMember(project_id=project.id, user_id=self.ids[name], role='applicant'))
             self.changes = {}
             for name in ['owner','admin','other']:

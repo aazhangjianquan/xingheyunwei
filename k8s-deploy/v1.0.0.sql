@@ -7,6 +7,21 @@ SET NAMES utf8mb4;
 CREATE DATABASE IF NOT EXISTS `yunweishenji` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE `yunweishenji`;
 
+CREATE TABLE IF NOT EXISTS departments (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	name VARCHAR(100) NOT NULL,
+	parent_id INTEGER,
+	active BOOL NOT NULL,
+	sort_order INTEGER NOT NULL,
+	description VARCHAR(500) NOT NULL,
+	revision INTEGER NOT NULL,
+	approval_mode VARCHAR(30) NOT NULL,
+	PRIMARY KEY (id),
+	FOREIGN KEY(parent_id) REFERENCES departments (id),
+	UNIQUE (name),
+	INDEX ix_departments_parent_id (parent_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS request_rate_limits (
 	subject VARCHAR(80) NOT NULL,
 	attempts TEXT NOT NULL,
@@ -16,18 +31,43 @@ CREATE TABLE IF NOT EXISTS request_rate_limits (
 	INDEX ix_request_rate_limits_updated_ms (updated_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS department_aliases (
+	name VARCHAR(100) NOT NULL,
+	department_id INTEGER NOT NULL,
+	PRIMARY KEY (name),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	INDEX ix_department_aliases_department_id (department_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department_positions (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	department_id INTEGER NOT NULL,
+	name VARCHAR(100) NOT NULL,
+	active BOOL NOT NULL,
+	manager_assignable BOOL NOT NULL,
+	revision INTEGER NOT NULL,
+	PRIMARY KEY (id),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	CONSTRAINT uq_department_position_name UNIQUE (department_id, name),
+	INDEX ix_department_positions_department_id (department_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS users (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	username VARCHAR(80) NOT NULL,
 	display_name VARCHAR(80) NOT NULL,
 	department VARCHAR(100) NOT NULL,
+	department_id INTEGER,
 	`role` VARCHAR(30) NOT NULL,
 	password_hash VARCHAR(255) NOT NULL,
 	feishu_open_id VARCHAR(500),
 	active BOOL NOT NULL,
 	created_at DATETIME NOT NULL,
+	organization_revision INTEGER NOT NULL DEFAULT '1',
 	PRIMARY KEY (id),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
 	UNIQUE (feishu_open_id),
+	INDEX ix_users_department_id (department_id),
 	INDEX ix_users_role (`role`),
 	UNIQUE INDEX ix_users_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -56,6 +96,41 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 	INDEX ix_audit_logs_created_at (created_at),
 	INDEX ix_audit_logs_kind_time (record_kind, created_at, id),
 	INDEX ix_audit_logs_wiki_space_id (wiki_space_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department_managers (
+	department_id INTEGER NOT NULL,
+	user_id INTEGER NOT NULL,
+	PRIMARY KEY (department_id, user_id),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	FOREIGN KEY(user_id) REFERENCES users (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department_memberships (
+	user_id INTEGER NOT NULL,
+	department_id INTEGER NOT NULL,
+	PRIMARY KEY (user_id, department_id),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	FOREIGN KEY(user_id) REFERENCES users (id),
+	INDEX ix_department_memberships_department_id (department_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department_position_roles (
+	position_id INTEGER NOT NULL,
+	`role` VARCHAR(30) NOT NULL,
+	PRIMARY KEY (position_id, `role`),
+	FOREIGN KEY(position_id) REFERENCES department_positions (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS department_user_positions (
+	user_id INTEGER NOT NULL,
+	position_id INTEGER NOT NULL,
+	department_id INTEGER NOT NULL,
+	PRIMARY KEY (user_id, position_id, department_id),
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	FOREIGN KEY(position_id) REFERENCES department_positions (id),
+	FOREIGN KEY(user_id) REFERENCES users (id),
+	INDEX ix_department_user_positions_department_id (department_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS login_tickets (
@@ -97,16 +172,34 @@ CREATE TABLE IF NOT EXISTS oauth_states (
 	FOREIGN KEY(user_id) REFERENCES users (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS personal_reminders (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	owner_id INTEGER NOT NULL,
+	content TEXT NOT NULL,
+	remind_at DATETIME NOT NULL,
+	state VARCHAR(20) NOT NULL,
+	created_at DATETIME NOT NULL,
+	updated_at DATETIME NOT NULL,
+	deleted_at DATETIME,
+	PRIMARY KEY (id),
+	FOREIGN KEY(owner_id) REFERENCES users (id),
+	INDEX ix_personal_reminders_due (state, remind_at, id),
+	INDEX ix_personal_reminders_owner (owner_id, deleted_at, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS projects (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	name VARCHAR(150) NOT NULL,
 	department VARCHAR(100) NOT NULL,
+	department_id INTEGER,
 	active BOOL NOT NULL,
 	created_by INTEGER NOT NULL,
 	created_at DATETIME NOT NULL,
 	PRIMARY KEY (id),
 	FOREIGN KEY(created_by) REFERENCES users (id),
-	UNIQUE (name)
+	FOREIGN KEY(department_id) REFERENCES departments (id),
+	UNIQUE (name),
+	INDEX ix_projects_department_id (department_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS system_settings (
@@ -134,6 +227,8 @@ CREATE TABLE IF NOT EXISTS wiki_spaces (
 	created_by INTEGER NOT NULL,
 	owner_id INTEGER,
 	kind VARCHAR(20) NOT NULL DEFAULT 'shared',
+	access_scope VARCHAR(20) NOT NULL DEFAULT 'members',
+	include_subdepartments BOOL NOT NULL DEFAULT '1',
 	category VARCHAR(60) NOT NULL DEFAULT '',
 	deleted_at DATETIME,
 	personal_user_id INTEGER,
@@ -187,6 +282,7 @@ CREATE TABLE IF NOT EXISTS change_requests (
 	environment VARCHAR(30) NOT NULL,
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	project_id INTEGER,
+	application_department_id INTEGER,
 	code VARCHAR(40) NOT NULL,
 	name VARCHAR(180) NOT NULL,
 	change_type VARCHAR(50) NOT NULL,
@@ -204,10 +300,12 @@ CREATE TABLE IF NOT EXISTS change_requests (
 	updated_at DATETIME NOT NULL,
 	deleted_at DATETIME,
 	PRIMARY KEY (id),
+	FOREIGN KEY(application_department_id) REFERENCES departments (id),
 	FOREIGN KEY(ops_owner_id) REFERENCES users (id),
 	FOREIGN KEY(owner_id) REFERENCES users (id),
 	FOREIGN KEY(project_id) REFERENCES projects (id),
 	UNIQUE (code),
+	INDEX ix_change_requests_application_department_id (application_department_id),
 	INDEX ix_change_requests_deleted_at (deleted_at),
 	INDEX ix_change_requests_project_id (project_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -215,6 +313,7 @@ CREATE TABLE IF NOT EXISTS change_requests (
 CREATE TABLE IF NOT EXISTS delivery_projects (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	project_id INTEGER,
+	application_department_id INTEGER,
 	code VARCHAR(40) NOT NULL,
 	name VARCHAR(180) NOT NULL,
 	customer VARCHAR(180) NOT NULL,
@@ -235,9 +334,11 @@ CREATE TABLE IF NOT EXISTS delivery_projects (
 	updated_at DATETIME NOT NULL,
 	deleted_at DATETIME,
 	PRIMARY KEY (id),
+	FOREIGN KEY(application_department_id) REFERENCES departments (id),
 	FOREIGN KEY(owner_id) REFERENCES users (id),
 	FOREIGN KEY(project_id) REFERENCES projects (id),
 	UNIQUE (code),
+	INDEX ix_delivery_projects_application_department_id (application_department_id),
 	INDEX ix_delivery_projects_deleted_at (deleted_at),
 	INDEX ix_delivery_projects_project_id (project_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -247,6 +348,7 @@ CREATE TABLE IF NOT EXISTS license_requests (
 	code VARCHAR(40) NOT NULL,
 	applicant_id INTEGER NOT NULL,
 	project_id INTEGER,
+	application_department_id INTEGER,
 	project_name VARCHAR(150) NOT NULL,
 	customer VARCHAR(180) NOT NULL,
 	product VARCHAR(150) NOT NULL,
@@ -271,6 +373,7 @@ CREATE TABLE IF NOT EXISTS license_requests (
 	reminder_updated_at DATETIME,
 	PRIMARY KEY (id),
 	FOREIGN KEY(applicant_id) REFERENCES users (id),
+	FOREIGN KEY(application_department_id) REFERENCES departments (id),
 	FOREIGN KEY(final_approver_id) REFERENCES users (id),
 	FOREIGN KEY(generated_by) REFERENCES users (id),
 	FOREIGN KEY(project_id) REFERENCES projects (id),
@@ -278,10 +381,42 @@ CREATE TABLE IF NOT EXISTS license_requests (
 	UNIQUE (code),
 	UNIQUE (license_key_hash),
 	INDEX ix_license_requests_applicant_id (applicant_id),
+	INDEX ix_license_requests_application_department_id (application_department_id),
 	INDEX ix_license_requests_deleted_at (deleted_at),
 	INDEX ix_license_requests_final_approver_id (final_approver_id),
 	INDEX ix_license_requests_project_id (project_id),
 	INDEX ix_license_requests_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS personal_reminder_attachments (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	reminder_id INTEGER NOT NULL,
+	uploaded_by INTEGER NOT NULL,
+	filename VARCHAR(255) NOT NULL,
+	storage_key VARCHAR(64) NOT NULL,
+	storage_backend VARCHAR(16) NOT NULL DEFAULT 'local',
+	storage_bucket VARCHAR(63) NOT NULL DEFAULT '',
+	extension VARCHAR(10) NOT NULL,
+	content_type VARCHAR(100) NOT NULL,
+	size INTEGER NOT NULL,
+	sha256 VARCHAR(64) NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (id),
+	FOREIGN KEY(reminder_id) REFERENCES personal_reminders (id),
+	FOREIGN KEY(uploaded_by) REFERENCES users (id),
+	UNIQUE (storage_key),
+	INDEX ix_personal_reminder_attachments_reminder_id (reminder_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS personal_reminder_recipients (
+	reminder_id INTEGER NOT NULL,
+	user_id INTEGER NOT NULL,
+	notification_id INTEGER,
+	PRIMARY KEY (reminder_id, user_id),
+	FOREIGN KEY(notification_id) REFERENCES notification_logs (id),
+	FOREIGN KEY(reminder_id) REFERENCES personal_reminders (id),
+	FOREIGN KEY(user_id) REFERENCES users (id),
+	UNIQUE (notification_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS project_members (
@@ -296,13 +431,14 @@ CREATE TABLE IF NOT EXISTS project_members (
 CREATE TABLE IF NOT EXISTS resource_requests (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	project_id INTEGER,
+	application_department_id INTEGER,
 	code VARCHAR(40) NOT NULL,
 	project_name VARCHAR(150) NOT NULL,
 	applicant_id INTEGER NOT NULL,
 	environment VARCHAR(30) NOT NULL,
 	resource_type VARCHAR(80) NOT NULL,
 	specification TEXT NOT NULL,
-	specification_values TEXT NOT NULL DEFAULT ('{}'),
+	specification_values TEXT NOT NULL DEFAULT (('{}')),
 	start_date VARCHAR(30) NOT NULL,
 	end_date VARCHAR(30) NOT NULL,
 	purpose TEXT NOT NULL,
@@ -321,9 +457,11 @@ CREATE TABLE IF NOT EXISTS resource_requests (
 	reminder_updated_at DATETIME,
 	PRIMARY KEY (id),
 	FOREIGN KEY(applicant_id) REFERENCES users (id),
+	FOREIGN KEY(application_department_id) REFERENCES departments (id),
 	FOREIGN KEY(project_id) REFERENCES projects (id),
 	FOREIGN KEY(reminder_updated_by) REFERENCES users (id),
 	UNIQUE (code),
+	INDEX ix_resource_requests_application_department_id (application_department_id),
 	INDEX ix_resource_requests_deleted_at (deleted_at),
 	INDEX ix_resource_requests_project_id (project_id),
 	INDEX ix_resource_requests_project_name (project_name),
@@ -474,6 +612,7 @@ CREATE TABLE IF NOT EXISTS workflow_nodes (
 	node_type VARCHAR(30) NOT NULL,
 	mode VARCHAR(10) NOT NULL,
 	config TEXT NOT NULL,
+  assignment_policy TEXT NULL,
 	status VARCHAR(30) NOT NULL,
 	PRIMARY KEY (id),
 	FOREIGN KEY(instance_id) REFERENCES workflow_instances (id),
@@ -550,4 +689,13 @@ CREATE TABLE IF NOT EXISTS task_transfers (
 	FOREIGN KEY(task_id) REFERENCES approvals (id),
 	FOREIGN KEY(to_user_id) REFERENCES users (id),
 	INDEX ix_task_transfers_task_id (task_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS wiki_space_departments (
+  space_id INTEGER NOT NULL,
+  department_id INTEGER NOT NULL,
+  PRIMARY KEY (space_id, department_id),
+  INDEX ix_wiki_space_departments_department_id (department_id),
+  FOREIGN KEY (space_id) REFERENCES wiki_spaces(id) ON DELETE CASCADE,
+  FOREIGN KEY (department_id) REFERENCES departments(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

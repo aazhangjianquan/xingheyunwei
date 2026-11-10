@@ -14,12 +14,12 @@ function setup(get){
 }
 test('projects load once with roles; the user directory loads only when editing',async()=>{
   const project={id:1,name:'测试项目',members:[]}
-  const h=setup(p=>({'/projects':[project],'/roles':[{id:'project_manager'}],'/users':[{id:4}]}[p]))
+  const h=setup(p=>({'/projects':[project],'/project-positions':[{id:'project_manager'}],'/project-candidates':[{id:4}]}[p]))
   await h.state.load()
-  assert.deepEqual(h.calls,['/projects','/roles'])
+  assert.deepEqual(h.calls,['/projects','/project-positions'])
   assert.deepEqual(h.state.projects.value,[project]);assert.deepEqual(h.state.people.value,[])
   await h.state.edit(project)
-  assert.deepEqual(h.calls,['/projects','/roles','/users'])
+  assert.deepEqual(h.calls,['/projects','/project-positions','/project-candidates'])
   assert.deepEqual(h.state.people.value,[{id:4}]);assert.equal(h.state.editing.value.id,1)
 })
 test('failed project fetch has a retry state instead of claiming there are no projects',async()=>{
@@ -55,7 +55,7 @@ test('project totals cover the full visible list while filters combine and reset
   assert.deepEqual(state.filteredProjects.value.map(p=>p.id),[2])
   assert.equal(state.hasFilters.value,true)
   assert.deepEqual(state.projectCounts.value,{total:4,active:2,inactive:2})
-  assert.deepEqual(calls,['/projects','/roles'])
+  assert.deepEqual(calls,['/projects','/project-positions'])
   state.resetFilters()
   assert.equal(state.hasFilters.value,false)
   assert.equal(state.filteredProjects.value.length,4)

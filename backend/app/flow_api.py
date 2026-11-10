@@ -1,6 +1,8 @@
 import json
 from fastapi import BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+from . import organization as org
+from . import project_positions as pp
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 from .database import get_db
@@ -8,14 +10,15 @@ from .models import (User, Project, ProjectMember, WorkflowTemplate, WorkflowVer
                      WorkflowNode, WorkflowInstance, Approval, TaskTransfer, UserRole, SystemSetting)
 from .roles import (ROLES, PROJECT_ROLES, PROJECT_MEMBER_ROLES, role_catalog,
                     role_ids, has_role, canonical_role, has_department_role,
-                    retained_snapshot_roles, managed_roles)
+                    retained_snapshot_roles, managed_roles, RETIRED_HEAD_ROLES)
 from . import flow_engine as flow
 from . import audit
 
 
 class ProjectIn(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     name: str = Field(min_length=1, max_length=150)
-    department: str = Field(min_length=1, max_length=100)
+    department_id: int | None = None
     active: bool = True
     members: list[dict]
 
@@ -39,6 +42,16 @@ def register_routes(app, current_user, require_role):
     def catalog(user=Depends(current_user)):
         return role_catalog()
 
+    @app.get('/api/project-positions')
+    def project_positions(user=Depends(current_user)):
+        return pp.catalog()
+
+    @app.get('/api/project-candidates')
+    def project_candidates(user=Depends(current_user), db: Session = Depends(get_db)):
+        # Project managers may assign any active platform member, without private account fields.
+        return [{'id':p.id, 'display_name':p.display_name, 'department':p.department, 'active':p.active}
+                for p in db.scalars(select(User).where(User.active == True).order_by(User.display_name,User.id))]
+
     def project_out(db, p, user):
         return projects_out(db, [p], user)[0]
 
@@ -57,14 +70,14 @@ def register_routes(app, current_user, require_role):
         for p in rows:
             members = by_project[p.id]
             scope = flow.project_manage_roles(p, user, members)
-            can_apply = has_role(user, 'admin') or any(m.user_id == user.id and has_role(user, m.role) for m in members)
+            can_apply = has_role(user, 'admin') or any(m.user_id == user.id and pp.migrated_positions(m.role) for m in members)
             # Canonical aliases can collapse two historical positions. Expose a
             # single checkbox for the resulting person/position combination.
             canonical_members = {(m.user_id, canonical_role(m.role)): m for m in members}
             result.append(serialize(p, can_manage=bool(scope), can_apply=can_apply, manageable_roles=sorted(scope),
                 members=[{'user_id': m.user_id, 'role': canonical_role(m.role),
                           'name': people[m.user_id].display_name if m.user_id in people else '已删除成员',
-                          'eligible': m.user_id in people and people[m.user_id].active and has_role(people[m.user_id], canonical_role(m.role))} for m in canonical_members.values()]))
+                          'eligible': m.user_id in people and people[m.user_id].active and bool(pp.migrated_positions(m.role))} for m in canonical_members.values()]))
         return result
 
     @app.get('/api/projects')
@@ -76,10 +89,12 @@ def register_routes(app, current_user, require_role):
         old = db.scalars(select(ProjectMember).where(ProjectMember.project_id == p.id)).all()
         old_unique = {(m.user_id, canonical_role(m.role)) for m in old}
         scope = flow.project_manage_roles(p, actor, old)
+        if has_role(actor, 'admin'):
+            scope |= RETIRED_HEAD_ROLES
         unique = set()
         for m in members:
             uid, role = m.get('user_id'), canonical_role(m.get('role'))
-            if type(uid) is not int or role not in PROJECT_MEMBER_ROLES:
+            if type(uid) is not int or (role not in PROJECT_MEMBER_ROLES and (uid, role) not in old_unique):
                 flow.fail('成员或岗位无效/重复')
             if (uid, role) in unique:
                 # A legacy client may submit project_owner and project_manager
@@ -87,25 +102,28 @@ def register_routes(app, current_user, require_role):
                 continue
             unique.add((uid, role))
         if any(role not in scope for _, role in unique ^ old_unique):
-            flow.fail('只能调整本项目可管理的岗位；项目经理由本部门项目经理负责人或管理员指定', 403)
+            flow.fail('只能调整本项目可管理的岗位；项目经理由系统管理员指定', 403)
         for uid, role in unique - old_unique:
             person = db.get(User, uid)
-            if not person or not person.active or not has_role(person, role):
-                flow.fail('新增岗位只能选择已启用且已获授对应角色的成员')
-            if not has_role(actor, 'admin') and role in managed_roles(actor) and person.department != actor.department:
+            if not person or not person.active:
+                flow.fail('新增岗位只能选择已启用的平台成员')
+            if not has_role(actor, 'admin') and role in managed_roles(actor) and not org.same_department(person, actor):
                 flow.fail('部门负责人只能分配本部门对应岗位的成员', 403)
-        if 'project_manager' not in {r for _, r in unique}:
+        if not any(role == 'project_manager' and db.get(User,uid) and db.get(User,uid).active for uid,role in unique):
             flow.fail('项目必须指定至少一名项目经理')
         db.execute(delete(ProjectMember).where(ProjectMember.project_id == p.id))
         for uid, role in unique:
             db.add(ProjectMember(project_id=p.id, user_id=uid, role=role))
         db.flush()
+        org.protect_pending_tasks(db)
 
     @app.post('/api/projects')
     def create_project(data: ProjectIn, db: Session = Depends(get_db), user=Depends(admin)):
+        org.write_lock(db, user); org.admin_only(user)
+        department = org.require_department(db, data.department_id) if data.department_id is not None else None
         if db.scalar(select(Project.id).where(Project.name == data.name.strip())):
             flow.fail('项目名称已存在', 409)
-        p = Project(name=data.name.strip(), department=data.department, active=data.active, created_by=user.id)
+        p = Project(name=data.name.strip(), department=department.name if department else '', department_id=department.id if department else None, active=data.active, created_by=user.id)
         db.add(p); db.flush()
         set_members(db, p, data.members, user)
         audit.record(db, user, 'create', 'project', p)
@@ -114,12 +132,16 @@ def register_routes(app, current_user, require_role):
 
     @app.put('/api/projects/{project_id}')
     def update_project(project_id: int, data: ProjectIn, db: Session = Depends(get_db), user=Depends(admin)):
+        org.write_lock(db, user); org.admin_only(user)
+        department = org.require_department(db, data.department_id) if data.department_id is not None else None
         p = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
         if not p: flow.fail('项目不存在', 404)
         if db.scalar(select(Project.id).where(Project.name == data.name.strip(), Project.id != p.id)):
             flow.fail('项目名称已存在', 409)
         before = audit.snapshot(db, 'project', p)
-        p.name, p.department, p.active = data.name.strip(), data.department, data.active
+        p.name, p.active = data.name.strip(), data.active
+        if 'department_id' in data.model_fields_set:
+            p.department, p.department_id = (department.name, department.id) if department else ('',None)
         set_members(db, p, data.members, user)
         action = 'disable' if before['active'] and not p.active else 'enable' if not before['active'] and p.active else 'update'
         audit.record(db, user, action, 'project', p, before=before)
@@ -128,6 +150,7 @@ def register_routes(app, current_user, require_role):
 
     @app.put('/api/projects/{project_id}/members')
     def update_members(project_id: int, data: MembersIn, db: Session = Depends(get_db), user=Depends(current_user)):
+        org.write_lock(db, user)
         p = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
         flow.project_access(db, project_id, user, manage=True)
         before = audit.snapshot(db, 'project', p)
@@ -141,7 +164,7 @@ def register_routes(app, current_user, require_role):
         t = db.get(WorkflowTemplate, kind)
         if not t: flow.fail('流程不存在', 404)
         versions = db.scalars(select(WorkflowVersion).where(WorkflowVersion.kind == kind).order_by(WorkflowVersion.version.desc())).all()
-        return {'kind': kind, 'draft': flow.normalize_definition(json.loads(t.draft)), 'revision': t.revision,
+        return {'kind': kind, 'draft': flow.department_first_definition(json.loads(t.draft)), 'revision': t.revision,
                 'versions': [serialize(v, definition=json.loads(v.definition)) for v in versions], 'fields': sorted(flow.FIELDS[kind])}
 
     @app.put('/api/admin/flows/{kind}/draft')
@@ -152,7 +175,7 @@ def register_routes(app, current_user, require_role):
         if len(flow.dump(data.definition)) > 250000: flow.fail('草稿过大')
         # Incomplete drafts are allowed; publish and preview enforce validation.
         before = {'revision': t.revision}
-        t.draft, t.updated_by, t.revision = flow.dump(flow.normalize_definition(data.definition)), user.id, t.revision + 1
+        t.draft, t.updated_by, t.revision = flow.dump(flow.department_first_definition(data.definition)), user.id, t.revision + 1
         audit.record(db, user, 'draft', 'workflow', before=before, after={'revision': t.revision},
                      target_id=kind, target_name=audit.TYPES.get(kind, kind) + '审批流程')
         db.commit()
@@ -160,7 +183,7 @@ def register_routes(app, current_user, require_role):
 
     @app.post('/api/admin/flows/{kind}/validate')
     def validate_flow(kind: str, data: dict, user=Depends(admin)):
-        return flow.validate(kind, data.get('definition'))
+        return flow.validate(kind, flow.department_first_definition(data.get('definition')))
 
     @app.post('/api/admin/flows/{kind}/preview')
     def preview_flow(kind: str, data: dict, db: Session = Depends(get_db), user=Depends(admin)):
@@ -173,7 +196,7 @@ def register_routes(app, current_user, require_role):
         t = db.scalar(select(WorkflowTemplate).where(WorkflowTemplate.kind == kind).with_for_update())
         if not t: flow.fail('流程不存在', 404)
         if t.revision != data.get('revision'): flow.fail('草稿已更新，请重新加载后发布', 409)
-        definition = flow.normalize_definition(json.loads(t.draft))
+        definition = flow.department_first_definition(json.loads(t.draft))
         flow.validate(kind, definition)
         # Check fixed member existence/grants now; project resolution happens per submission.
         def walk(steps):
@@ -183,8 +206,8 @@ def register_routes(app, current_user, require_role):
                 elif n['assignee']['source'] == 'fixed':
                     for uid in n['assignee']['user_ids']:
                         p = db.get(User, uid)
-                        if not p or not p.active or (n['type'] == 'execution' and not has_role(p, 'operator')):
-                            flow.fail(f"{n['name']}：固定成员无效或无运维权限")
+                        if not p or not p.active:
+                            flow.fail(f"{n['name']}：固定成员不存在或已停用")
         walk(definition['steps'])
         current = db.scalar(select(WorkflowVersion).where(WorkflowVersion.kind == kind).order_by(WorkflowVersion.version.desc()))
         v = WorkflowVersion(kind=kind, version=(current.version if current else 0) + 1, definition=flow.dump(definition), published_by=user.id)
@@ -200,6 +223,7 @@ def register_routes(app, current_user, require_role):
 
 
 def transfer(db, task_id, data, tasks, user, objects, notify):
+    org.write_lock(db, user, track_pending=False)
     task = db.get(Approval, task_id)
     if not task: flow.fail('任务不存在', 404)
     obj = db.scalar(select(objects[task.object_type]).where(objects[task.object_type].id == task.object_id).with_for_update())
@@ -209,11 +233,11 @@ def transfer(db, task_id, data, tasks, user, objects, notify):
     snap = json.loads(task.assignee_snapshot or '{}')
     if not person or not person.active or person.id == flow.owner_id(task.object_type, obj):
         flow.fail('处理人无效或与申请人相同')
-    required = snap.get('required_role')
-    matches = has_department_role(person, required) if snap.get('department') else has_role(person, required)
-    if required and not matches: flow.fail('新处理人未获对应岗位角色')
-    if snap.get('department') and person.department != snap['department']: flow.fail('新处理人不属于申请部门')
-    if not required and snap.get('roles') and not retained_snapshot_roles(person, snap['roles']): flow.fail('新处理人未获原节点所需角色')
+    policy = pp.task_policy(task) or snap.get('assignment_policy')
+    if policy:
+        if not pp.policy_eligible(person,policy): flow.fail('新处理人未在关联项目的对应岗位中任命')
+    elif not flow.snapshot_eligible(person,snap):
+        flow.fail('新处理人不满足原节点的部门或岗位要求')
     if db.scalar(select(Approval.id).where(Approval.node_run_id == task.node_run_id, Approval.assignee_id == person.id, Approval.id != task.id)):
         flow.fail('此人已在当前节点中，不能重复分配')
     reason = str(data.get('reason', '')).strip()

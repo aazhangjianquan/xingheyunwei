@@ -17,7 +17,7 @@ function harness({ kind = 'license', editable = true, write, read } = {}) {
     get: async path => { calls.push({ method: 'GET', path }); return read ? read(path) : props.value },
   }
   const keys = Object.keys(dependencies).filter(key => key !== 'default' && /^[A-Za-z_$][\w$]*$/.test(key))
-  const factory = new Function('d', `const {${keys.join(',')}}=d;\n${script}\nreturn {toggle,saving,error,notice,editContacts,saveContacts,contactIds,contactReason,editingContacts};`)
+  const factory = new Function('d', `const {${keys.join(',')}}=d;\n${script}\nreturn {toggle,saving,error,notice,editContacts,saveContacts,contactIds,contactReason,editingContacts,nextReminderText};`)
   const scope = vue.effectScope(), state = scope.run(() => factory(dependencies))
   return { props, calls, events, state, close: () => scope.stop() }
 }
@@ -77,5 +77,33 @@ test('legacy operator assignment requires a reason and uses the resource endpoin
     await h.state.saveContacts()
     assert.deepEqual(h.calls[1], { method: 'PATCH', path: '/resource/12/reminder/contacts', body: { user_ids: [9], reason: '核对执行记录' } })
     assert.equal(h.state.editingContacts.value, false)
+  } finally { h.close() }
+})
+
+test('reading next milestone uses its scheduled time and never writes modification metadata', () => {
+  const h = harness()
+  try {
+    h.props.value.next_at = '2026-11-11T02:00:00+00:00'
+    h.props.value.updated_at = '2026-11-05T02:40:32+00:00'
+    h.props.value.current_delivery = { recipients: [{ id: 9, status: 'unconfigured' }] }
+    for (let i = 0; i < 3; i++) {
+      assert.match(h.state.nextReminderText.value, /2026\/11\/11 10:00:00/)
+      assert.equal(h.props.value.updated_at, '2026-11-05T02:40:32+00:00')
+    }
+    assert.deepEqual(h.calls, [])
+    assert.deepEqual(h.events, [])
+  } finally { h.close() }
+})
+
+test('no future milestone does not claim failed or unconfigured deliveries are complete', () => {
+  const h = harness()
+  try {
+    h.props.value.effective = true
+    h.props.value.next_at = null
+    h.props.value.current_delivery = { recipients: [{ id: 9, status: 'failed' }] }
+    assert.equal(h.state.nextReminderText.value, '无后续提醒节点')
+    h.props.value.enabled = false
+    assert.equal(h.state.nextReminderText.value, '已关闭')
+    assert.deepEqual(h.calls, [])
   } finally { h.close() }
 })

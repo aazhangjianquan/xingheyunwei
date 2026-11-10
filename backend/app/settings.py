@@ -13,11 +13,12 @@ DEFAULTS = {
     "feishu_app_secret": "",
     "feishu_tenant_key": "",
     "feishu_login_enabled": False,
+    "feishu_task_login_enabled": False,
     "feishu_notifications_enabled": False,
     "local_login_enabled": True,
 }
 SECRET_KEYS = {"feishu_app_secret"}
-PUBLIC_KEYS = ("site_name", "feishu_login_enabled", "local_login_enabled")
+PUBLIC_KEYS = ("site_name", "feishu_login_enabled", "local_login_enabled", "feishu_task_login_enabled")
 PASSWORD_LOGIN_MODE = {"feishu_login_enabled": False, "local_login_enabled": True}
 
 
@@ -49,6 +50,7 @@ def admin_settings(db: Session):
     settings = all_values(db)
     settings["feishu_app_secret_set"] = bool(settings.pop("feishu_app_secret"))
     settings.pop("feishu_tenant_key", None)
+    settings['feishu_task_callback_url'] = settings['public_base_url'].rstrip('/') + '/api/auth/feishu/callback'
     return settings
 
 
@@ -71,7 +73,7 @@ def save_settings(db: Session, changes: dict, actor_id: int):
         if key not in DEFAULTS:
             raise HTTPException(400, "不支持的配置项")
         if key in PASSWORD_LOGIN_MODE and new_value is not PASSWORD_LOGIN_MODE[key]:
-            raise HTTPException(400, "平台已统一使用账号密码登录，飞书仅用于消息通知")
+            raise HTTPException(400, "普通浏览器使用账号密码登录，飞书通用登录已停用；任务免密请使用独立开关")
         if key in SECRET_KEYS and new_value == "":
             continue  # 留空保留已保存密钥
         if isinstance(DEFAULTS[key], bool) and not isinstance(new_value, bool):
@@ -80,10 +82,13 @@ def save_settings(db: Session, changes: dict, actor_id: int):
             raise HTTPException(400, "配置值格式错误")
         current[key] = new_value.strip() if isinstance(new_value, str) else new_value
     parsed = urlparse(current["public_base_url"])
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+    if (parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or
+            parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
         raise HTTPException(400, "平台地址需为完整 HTTP(S) 根地址")
     if current["feishu_notifications_enabled"] and not (current["feishu_app_id"] and current["feishu_app_secret"]):
         raise HTTPException(400, "请先填写飞书 App ID 和 App Secret")
+    if current['feishu_task_login_enabled'] and not (current['feishu_app_id'] and current['feishu_app_secret']):
+        raise HTTPException(400, '启用飞书任务免密前，请先填写飞书 App ID 和 App Secret')
     for key in changes:
         if key in SECRET_KEYS and changes[key] == "":
             continue

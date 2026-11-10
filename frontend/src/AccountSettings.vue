@@ -95,7 +95,7 @@ onBeforeUnmount(() => { disposed = true; clearPasswords(); if (previousFocus?.is
         <p v-if="success" class="account-message success" role="status"><CircleCheck :size="16" />{{success}}</p>
         <form v-if="tab==='profile'" id="account-profile" role="tabpanel" aria-labelledby="account-profile-tab" @submit.prevent="saveName">
           <label class="field"><span>姓名 <b>*</b></span><input ref="nameInput" v-model="displayName" :disabled="saving" required maxlength="80" autocomplete="name" placeholder="请输入你的姓名" /><small class="field-help">用于单据申请人、审批人及个人资料展示。</small></label>
-          <div class="account-readonly"><div><span>登录账号</span><strong>{{user.username}}</strong></div><div><span>所属部门</span><strong>{{user.department || '未设置'}}</strong></div><div><span>当前角色</span><strong>{{user.role_name}}</strong></div></div>
+          <div class="account-readonly"><div><span>登录账号</span><strong>{{user.username}}</strong></div><div><span>所属部门</span><strong>{{user.departments?.map(d=>d.path).join('；') || user.department_path || user.department || '待分配'}}</strong></div><div><span>部门岗位</span><strong>{{user.positions?.map(p=>p.department_name+' / '+p.name).join('、') || '未分配岗位'}}</strong></div><div><span>当前角色</span><strong>{{user.role_name}}</strong></div></div>
           <p class="field-help">账号、部门和角色由系统管理员维护。</p>
           <div class="form-footer"><button type="button" class="secondary-button" :disabled="saving" @click="close">关闭</button><button class="primary-button" :disabled="saving || !nameValid || !nameChanged">{{saving ? '保存中…' : '保存姓名'}}</button></div>
         </form>

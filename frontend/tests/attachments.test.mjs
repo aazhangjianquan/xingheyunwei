@@ -8,7 +8,7 @@ const script=readFileSync(new URL('../src/DeliveryAttachments.vue',import.meta.u
 function harness(props={deliveryId:9}) {
   const calls=[],cleanup=[],mounted=[],created=[],revoked=[],anchors=[],timers=[]
   let sequence=0,read=async()=>({items:[],can_upload:true,max_size:20*1024*1024,extensions:['.txt','.docx','.xlsx','.pdf']}),write=async(path,file)=>({id:++sequence,filename:file.name}),blob=async()=>new Blob(['preview'],{type:'application/pdf'})
-  const deps={...vue,defineProps:()=>props,onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>cleanup.push(fn),
+  const deps={...vue,defineProps:()=>props,defineEmits:()=>()=>{},onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>cleanup.push(fn),
     createClientId,
     get:path=>{calls.push({method:'GET',path});return read(path)},
     getBlob:path=>{calls.push({method:'BLOB',path});return blob(path)},

@@ -1,20 +1,24 @@
 <script setup>
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { AlertCircle, Download, Eye, FileText, Paperclip, RefreshCw, Upload, X } from 'lucide-vue-next'
 import { get, getBlob, uploadFile } from './api'
 import { createClientId } from './client-id'
 
 const props = defineProps({ deliveryId: { type: Number, default: null }, uploadQueue: { type: Array, default: null }, disabled: Boolean, kind: { type: String, default: 'delivery' } })
+const emit = defineEmits(['busy', 'blocked'])
 const draft = !props.deliveryId
 const items = ref([]), canUpload = ref(draft), loading = ref(!draft), error = ref('')
 const maxSize = ref(20 * 1024 * 1024), extensions = ref(['.doc','.docx','.xls','.xlsx','.pdf','.txt','.csv','.md','.ppt','.pptx','.rtf','.png','.jpg','.jpeg','.gif','.webp'])
 const picker = ref(null), queue = ref(props.uploadQueue || []), uploading = ref(false), dragOver = ref(false)
+watch(uploading, value => emit('busy', value), {flush:'sync'})
+const queueBlocked = computed(() => queue.value.some(entry => entry.status !== 'done'))
+watch(queueBlocked, value => emit('blocked', value), {flush:'sync'})
 const preview = ref(null), previewUrl = ref(''), previewText = ref(''), previewTruncated = ref(false)
 const previewLoading = ref(false), previewError = ref(''), closeButton = ref(null), downloading = ref(null)
 const previewPanel = ref(null), downloadError = ref('')
 const downloadUrls = new Set()
 let disposed = false, revision = 0, previewRevision = 0, previousFocus
-const endpoint = () => `/${props.kind === 'change' ? 'changes' : 'deliveries'}/${props.deliveryId}/attachments`
+const endpoint = () => `/${props.kind === 'personal_reminder' ? 'personal-reminders' : props.kind === 'change' ? 'changes' : 'deliveries'}/${props.deliveryId}/attachments`
 const formatSize = value => value >= 1024 * 1024 ? `${(value / (1024 * 1024)).toFixed(1)} MB` : value >= 1024 ? `${(value / 1024).toFixed(1)} KB` : `${value} B`
 const dateTime = value => new Date(/Z$|[+-]\d{2}:\d{2}$/.test(value) ? value : value + 'Z').toLocaleString('zh-CN', {timeZone:'Asia/Shanghai',hour12:false})
 
@@ -37,7 +41,7 @@ function addFiles(files) {
   if (!canUpload.value || uploading.value || props.disabled) return
   for (const file of files) {
     const extension = '.' + file.name.split('.').at(-1).toLowerCase()
-    const allowedExtensions = props.kind === 'change' ? extensions.value : extensions.value.filter(ext => !['.png','.jpg','.jpeg','.gif','.webp'].includes(ext))
+    const allowedExtensions = props.kind !== 'delivery' ? extensions.value : extensions.value.filter(ext => !['.png','.jpg','.jpeg','.gif','.webp'].includes(ext))
     const message = !allowedExtensions.includes(extension) ? '不支持此文件类型' : !file.size ? '不能上传空文件' : file.size > maxSize.value ? `文件超过 ${formatSize(maxSize.value)} 限制` : ''
     queue.value.push({id:createClientId(), file, name:file.name, size:file.size, status:message ? 'invalid' : 'waiting', message})
   }
@@ -141,17 +145,17 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="detail-section delivery-attachments" aria-labelledby="delivery-attachments-title">
-    <div class="attachment-heading"><div><h3 id="delivery-attachments-title"><Paperclip :size="16" />{{props.kind === 'change' ? '变更附件' : '项目附件'}} <span>{{draft ? queue.length : items.length}}</span></h3><p>{{props.kind === 'change' ? (draft ? '随变更申请提交问题截图、方案文档与其他依据（选填）' : '集中保存变更问题截图、方案文档与其他依据') : (draft ? '随申请提交交付方案、项目清单与相关文档（选填）' : '集中保存交付方案、项目清单与相关文档')}}</p></div><button type="button" v-if="canUpload" class="secondary-button" :disabled="uploading || disabled" @click="picker.click()"><Upload :size="15" />添加附件</button></div>
+    <div class="attachment-heading"><div><h3 id="delivery-attachments-title"><Paperclip :size="16" />{{props.kind === 'personal_reminder' ? '提醒附件' : props.kind === 'change' ? '变更附件' : '项目附件'}} <span>{{draft ? queue.length : items.length}}</span></h3><p>{{props.kind === 'personal_reminder' ? '附件仅创建人与指定的被提醒人可以访问' : props.kind === 'change' ? (draft ? '随变更申请提交问题截图、方案文档与其他依据（选填）' : '集中保存变更问题截图、方案文档与其他依据') : (draft ? '随申请提交交付方案、项目清单与相关文档（选填）' : '集中保存交付方案、项目清单与相关文档')}}</p></div><button type="button" v-if="canUpload" class="secondary-button" :disabled="uploading || disabled" @click="picker.click()"><Upload :size="15" />添加附件</button></div>
     <p v-if="error" class="attachment-error" role="alert"><AlertCircle :size="15" />{{error}}<button type="button" class="text-button" @click="load">刷新附件</button></p>
     <div v-if="canUpload" class="attachment-drop" :class="{dragging:dragOver,disabled:uploading || disabled}" @dragover.prevent="dragOver=!uploading && !disabled" @dragleave.prevent="dragOver=false" @drop.prevent="onDrop">
-      <input ref="picker" class="attachment-picker" type="file" multiple tabindex="-1" :accept="(props.kind === 'change' ? extensions : extensions.filter(ext => !['.png','.jpg','.jpeg','.gif','.webp'].includes(ext))).join(',')" :disabled="uploading || disabled" aria-label="选择交付附件" @change="addFiles([...$event.target.files])" />
+      <input ref="picker" class="attachment-picker" type="file" multiple tabindex="-1" :accept="(props.kind !== 'delivery' ? extensions : extensions.filter(ext => !['.png','.jpg','.jpeg','.gif','.webp'].includes(ext))).join(',')" :disabled="uploading || disabled" :aria-label="props.kind === 'personal_reminder' ? '选择提醒附件' : '选择附件'" @change="addFiles([...$event.target.files])" />
       <FileText :size="23" /><div><strong>{{uploading ? '正在上传，请稍候…' : '拖入文档，或点击添加附件'}}</strong><small>Word / Excel / PDF / TXT / CSV / Markdown / PPT / RTF / 图片 · 单个文件不超过 {{formatSize(maxSize)}}</small></div>
     </div>
-    <p v-else-if="!draft && !loading" class="attachment-hint">仅创建人可上传；有此单据查看权限的成员可在线预览和下载。</p>
+    <p v-else-if="!draft && !loading" class="attachment-hint">{{props.kind === 'personal_reminder' ? '已启用的提醒不能再添加附件；被提醒人到时可在线预览和下载。' : '仅创建人可上传；有此单据查看权限的成员可在线预览和下载。'}}</p>
     <p v-if="draft" class="attachment-hint">选择后可移除或重新选择，提交申请后自动上传。支持多选和拖拽。</p>
     <div v-if="queue.length" class="attachment-queue" aria-live="polite"><div class="attachment-queue-title"><strong>{{draft ? '已选附件' : '本次上传'}}</strong><div><button type="button" v-if="!draft && !uploading && queue.some(e=>e.status==='waiting')" class="text-button" @click="processQueue()">继续上传</button><button type="button" class="text-button" :disabled="uploading || disabled" @click="clearQueue">{{draft ? '清空选择' : '清空记录'}}</button></div></div><div v-for="entry in queue" :key="entry.id" class="attachment-queue-row"><div><strong>{{entry.name}}</strong><small v-if="entry.message" :class="{failure:entry.status!=='done'}">{{entry.message}}</small></div><span :class="{failure:['failed','invalid'].includes(entry.status),success:entry.status==='done'}">{{{waiting:draft?'待提交':'等待上传',uploading:'上传中',done:'已上传',failed:'上传失败',invalid:'未上传'}[entry.status]}}</span><button type="button" v-if="draft" class="text-button" :disabled="disabled" @click="removeFile(entry.id)">移除</button><button type="button" v-if="!draft && entry.status==='failed'" class="text-button" :disabled="uploading || !canUpload" @click="processQueue(entry.id)">重试</button></div></div>
     <p v-if="loading" class="attachment-empty" role="status">正在加载附件…</p>
-    <div v-else-if="!draft && !items.length && !error" class="attachment-empty"><Paperclip :size="22" /><strong>{{props.kind === 'change' ? '暂无变更附件' : '暂无项目附件'}}</strong><span>{{canUpload ? '添加文档或图片，便于审批与协作。' : '创建人上传后，可在这里查看。'}}</span></div>
+    <div v-else-if="!draft && !items.length && !error" class="attachment-empty"><Paperclip :size="22" /><strong>{{props.kind === 'personal_reminder' ? '暂无提醒附件' : props.kind === 'change' ? '暂无变更附件' : '暂无项目附件'}}</strong><span>{{canUpload ? '添加文档或图片，便于审批与协作。' : '创建人上传后，可在这里查看。'}}</span></div>
     <div v-for="item in items" :key="item.id" class="attachment-row"><div class="attachment-type" :class="item.extension.slice(1)">{{item.extension.slice(1).toUpperCase()}}</div><div class="attachment-main"><strong :title="item.filename">{{item.filename}}</strong><small>{{formatSize(item.size)}} · {{item.uploader_name}} · {{dateTime(item.created_at)}}</small></div><div class="attachment-actions"><button type="button" class="text-button" @click="openPreview(item)"><Eye :size="14" />预览</button><button type="button" class="text-button" :disabled="downloading!==null" @click="download(item)"><Download :size="14" />{{downloading===item.id?'下载中':'下载'}}</button></div></div>
     <Teleport to="body"><div v-if="preview" class="attachment-preview-backdrop" @click.self="closePreview" @keydown="onPreviewKey"><section ref="previewPanel" class="attachment-preview-panel" role="dialog" aria-modal="true" aria-labelledby="attachment-preview-title"><div class="attachment-preview-head"><div><span>文档预览</span><h3 id="attachment-preview-title">{{preview.filename}}</h3></div><div><button type="button" class="secondary-button" :disabled="downloading!==null" @click="download(preview)"><Download :size="15" />下载原文件</button><button ref="closeButton" type="button" class="icon-button" aria-label="关闭附件预览" @click="closePreview"><X :size="21" /></button></div></div><p v-if="downloadError" class="attachment-error" role="alert">{{downloadError}}</p><div v-if="previewLoading" class="attachment-preview-message" role="status"><RefreshCw :size="26" /><strong>正在准备预览</strong><p>Office 文档首次预览需要转换，请稍候。</p></div><div v-else-if="previewError" class="attachment-preview-message" role="alert"><AlertCircle :size="27" /><strong>暂时无法预览</strong><p>{{previewError}}</p><button type="button" class="secondary-button" @click="openPreview(preview)">重新预览</button></div><template v-else-if="preview.preview_type==='text'"><p v-if="previewTruncated" class="attachment-text-note">仅预览前 50 万个字符，完整内容请下载原文件。</p><pre class="attachment-text">{{previewText}}</pre></template><img v-else-if="previewUrl && preview.preview_type==='image'" :src="previewUrl" :alt="preview.filename" class="attachment-image" /><iframe v-else-if="previewUrl" :src="previewUrl" :title="preview.filename" class="attachment-pdf"></iframe><p v-if="!previewLoading && !previewError && preview.preview_type==='pdf'" class="attachment-preview-foot">{{preview.preview_type==='image'?'图片预览；原始图片可下载查看。':'Office 文档以 PDF 展示，分页和公式显示以转换结果为准；原始文档可下载查看。'}}</p></section></div></Teleport>
   </section>

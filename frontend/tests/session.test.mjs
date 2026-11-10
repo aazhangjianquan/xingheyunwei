@@ -7,11 +7,11 @@ import { readBootstrapSettings } from '../src/bootstrap.js'
 const script=readFileSync(new URL('../src/App.vue',import.meta.url),'utf8').match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm,'')
 const name='元知星辰'
 const member={id:42,display_name:'测试成员',roles:['applicant']}
-const config={site_name:name,feishu_login_enabled:false,local_login_enabled:true}
-function harness({token='existing-session',bootstrap=config,path='/projects',get,post}={}) {
+const config={site_name:name,feishu_login_enabled:false,feishu_task_login_enabled:false,local_login_enabled:true}
+function harness({token='existing-session',bootstrap=config,path='/projects',hash='',agent='',get,post}={}) {
   const values=new Map(token?[['yunwei_token',token]]:[])
   const calls=[],timers=new Set()
-  const location={pathname:path,search:''}
+  const location={pathname:path,search:'',hash,replace:target=>calls.push({redirect:target})}
   const listeners=new Map()
   const doc={title:'',getElementById:()=>bootstrap?{textContent:JSON.stringify(bootstrap)}:null}
   const routes={ '/auth/options':config,'/me':member,'/roles':[],'/projects':[],'/wiki':[] }
@@ -19,15 +19,95 @@ function harness({token='existing-session',bootstrap=config,path='/projects',get
   const deps={...vue,...icons,readBootstrapSettings:()=>readBootstrapSettings(doc), onMounted:()=>{},
     get:async p=>{calls.push(p);return get?get(p,routes):routes[p]},post:post || (async()=>({user:member,token:'new-session'})),put:async()=>{},patch:async()=>{},
     document:doc,localStorage:{getItem:key=>values.get(key)||null,setItem:(key,v)=>values.set(key,v),removeItem:key=>values.delete(key)},
-    window:{location,history:{pushState:(a,b,path)=>{location.pathname=path},replaceState(){}},
+    window:{location,navigator:{userAgent:agent},history:{pushState:(a,b,path)=>{location.pathname=path},replaceState(a,b,path){location.pathname=path;location.search='';location.hash=''}},
       setTimeout:(fn,ms)=>{const id=setTimeout(fn,ms);timers.add(id);return id},addEventListener:(key,fn)=>listeners.set(key,fn)},
   }
   const keys=Object.keys(deps).filter(k=>k!=='default'&&/^[A-Za-z_$][\w$]*$/.test(k))
-  const factory=new Function('d',`const {${keys.join(',')}}=d;\n${script}\nreturn {user,authOptions,restoringSession,startupError,page,restoreSession,login,loginForm,loginError,saving,expireSession,logout,profileOpen,openProfile,applyProfile};`)
+  const factory=new Function('d',`const {${keys.join(',')}}=d;\n${script}\nreturn {user,authOptions,restoringSession,startupError,page,restoreSession,login,loginForm,loginError,saving,expireSession,logout,profileOpen,openProfile,applyProfile,feishuTaskRetry,startFeishuTaskLogin};`)
   const s=scope.run(()=>factory(deps))
   return {s,calls,values,doc,location,dispose(){scope.stop();for(const id of timers)clearTimeout(id)}}
 }
 const error=status=>Object.assign(new Error('接口暂不可用'),{status})
+test('Feishu opens old and new task links through official authentication before restoring another account',async()=>{
+  for(const path of ['/resource/7','/change/8','/delivery/9','/licenses/10']) {
+    const h=harness({path,agent:'Mozilla/5.0 Feishu/7.40.0',get:(p,defaults)=>p==='/auth/options'?{...config,feishu_task_login_enabled:true}:defaults[p]})
+    try {
+      await h.s.restoreSession()
+      assert.equal(h.s.user.value,null)
+      assert.equal(h.s.restoringSession.value,true)
+      assert.equal(h.calls.includes('/me'),false)
+      assert.deepEqual(h.calls.at(-1),{redirect:`/api/auth/feishu/task/start?${new URLSearchParams({next:path})}`})
+    } finally {h.dispose()}
+  }
+})
+test('external browsers and Feishu with a disabled switch retain password login',async()=>{
+  for(const agent of ['Mozilla/5.0 Chrome/130.0','Mozilla/5.0 Lark/7.40.0']) {
+    const h=harness({token:null,path:'/licenses/7',agent})
+    try {
+      await h.s.restoreSession()
+      assert.equal(h.s.user.value,null)
+      assert.equal(h.s.restoringSession.value,false)
+      assert.equal(h.calls.some(c=>c.redirect),false)
+      assert.equal(h.location.pathname,'/licenses/7')
+    } finally {h.dispose()}
+  }
+})
+test('a browser visiting the homepage does not begin Feishu login',async()=>{
+  const h=harness({token:null,path:'/',agent:'Feishu/7.40.0',get:(p,d)=>p==='/auth/options'?{...config,feishu_task_login_enabled:true}:d[p]})
+  try {await h.s.restoreSession();assert.equal(h.calls.some(c=>c.redirect),false);assert.equal(h.s.user.value,null)}
+  finally {h.dispose()}
+})
+test('task callback consumes ticket, removes its fragment and replaces an older platform identity',async()=>{
+  const h=harness({path:'/licenses/7',hash:'#feishu_ticket=one-use',agent:'Feishu/7.40.0',post:async(path,body)=>{
+    assert.equal(path,'/auth/ticket');assert.equal(body.ticket,'one-use')
+    return {token:'feishu-session',user:{...member,id:99,display_name:'飞书实际用户'},next:'/licenses/7'}
+  }})
+  try {
+    await h.s.restoreSession()
+    assert.equal(h.s.user.value.id,99)
+    assert.equal(h.values.get('yunwei_token'),'feishu-session')
+    assert.equal(h.location.hash,'')
+    assert.equal(h.location.pathname,'/licenses/7')
+    assert.equal(h.s.page.value,'licenses')
+    assert.equal(h.calls.includes('/me'),false)
+    assert.equal(h.s.feishuTaskRetry.value,false)
+  } finally {h.dispose()}
+})
+test('task callback errors remove the prior identity, keep the task and offer explicit retry without looping',async()=>{
+  const h=harness({path:'/resource/7',hash:'#feishu_error=unbound',agent:'Feishu/7.40.0'})
+  try {
+    await h.s.restoreSession()
+    assert.equal(h.s.user.value,null)
+    assert.equal(h.values.has('yunwei_token'),false)
+    assert.ok(h.s.loginError.value.includes('尚未绑定'))
+    assert.equal(h.location.hash,'')
+    assert.equal(h.location.pathname,'/resource/7')
+    assert.equal(h.s.feishuTaskRetry.value,true)
+    await h.s.restoreSession()
+    assert.equal(h.calls.some(c=>c.redirect),false)
+    h.s.startFeishuTaskLogin()
+    assert.ok(h.calls.at(-1).redirect.startsWith('/api/auth/feishu/task/start?'))
+  } finally {h.dispose()}
+})
+test('failed ticket exchange keeps password login and never restores an older account',async()=>{
+  for(const message of ['飞书登录票据已失效','此账号已停用']) {
+    const h=harness({path:'/delivery/9',hash:'#feishu_ticket=expired',agent:'Feishu/7.40.0',post:async()=>{throw new Error(message)}})
+    try {
+      await h.s.restoreSession()
+      assert.equal(h.s.user.value,null)
+      assert.equal(h.values.has('yunwei_token'),false)
+      assert.equal(h.s.loginError.value,message)
+      assert.equal(h.location.hash,'')
+      assert.equal(h.calls.includes('/me'),false)
+    } finally {h.dispose()}
+  }
+})
+test('a copied callback in an external browser cannot consume a ticket',async()=>{
+  let used=false
+  const h=harness({token:null,path:'/resource/7',hash:'#feishu_ticket=copied',agent:'Chrome/130.0',post:async()=>{used=true}})
+  try {await h.s.restoreSession();assert.equal(used,false);assert.equal(h.s.user.value,null);assert.ok(h.s.loginError.value.includes('飞书客户端'));assert.equal(h.s.feishuTaskRetry.value,false)}
+  finally {h.dispose()}
+})
 test('administrators, each business role and multiple-role members can open the same account settings',async()=>{
   const roles=['admin','applicant','department_head','ops_head','leader','operator','project_owner','project_manager','project_director','sales_head','sales_director','development_head','license_manager']
   for(const grants of [...roles.map(role=>[role]),['admin','operator','license_manager']]) {
